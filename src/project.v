@@ -292,32 +292,28 @@ module tt_um_kilian_waves (
   end
 
   // --- Block D: output with Bayer-dithered haze + chromatic fringe.
-  //   Dots render solid white. Between dots, the interference wave field
-  //   is shown as a dim coloured haze:
-  //     primary band (ra_lat[10] ^ rb_lat[10]) → 50% coverage via 2x2 Bayer
-  //     finer  band  (ra_lat[9]  ^ rb_lat[9])  → 25% coverage, green only
-  //   Chromatic axis: ra_lat[10] picks warm (red) vs cool (blue) tint on
-  //   the primary-band haze. Cost: a handful of muxes, no added flops.
-  wire bayer_hi = x[0] ^ y[0];         // 50% checker
-  wire bayer_lo = x[0] & y[0];         // 25% sparse
+  //   Toned-down single-layer variant: only the primary interference band
+  //   shows, and only every 4th pixel (x[0] & y[0]), so dots dominate and
+  //   the wave field reads as a subtle ambient glow.
+  //   ra_lat[8] (= d² bit 11) fringes ~4x faster than ra_lat[10] — the
+  //   slow bit banded visibly. `warm` XORs with a 16-px-periodic bit so
+  //   the chromatic tint mottles rather than drawing big contiguous
+  //   patches.
+  wire bayer    = x[0] & y[0];             // 25% sparse
+  wire wave_lo  = ra_lat[8] ^ rb_lat[8];
+  wire warm     = ra_lat[8] ^ x[4];
 
-  wire wave_lo  = ra_lat[10] ^ rb_lat[10];
-  wire wave_hi  = ra_lat[9]  ^ rb_lat[9];
-  wire warm     = ra_lat[10];
+  wire dot_on = display_on & dot;
+  wire haze   = display_on & ~dot & wave_lo & bayer;
 
-  wire dot_on    = display_on & dot;
-  wire haze_full = display_on & ~dot & wave_lo & bayer_hi;
-  wire haze_weak = display_on & ~dot & wave_hi & bayer_lo;
-
-  wire [1:0] R = dot_on    ? 2'b11
-               : haze_full ? (warm ? 2'b01 : 2'b00)
+  wire [1:0] R = dot_on ? 2'b11
+               : haze   ? (warm ? 2'b01 : 2'b00)
                : 2'b00;
-  wire [1:0] G = dot_on    ? 2'b11
-               : haze_full ? 2'b01
-               : haze_weak ? 2'b01
+  wire [1:0] G = dot_on ? 2'b11
+               : haze   ? 2'b01
                : 2'b00;
-  wire [1:0] B = dot_on    ? 2'b11
-               : haze_full ? (warm ? 2'b00 : 2'b01)
+  wire [1:0] B = dot_on ? 2'b11
+               : haze   ? (warm ? 2'b00 : 2'b01)
                : 2'b00;
 
   // TinyVGA Pmod: {hsync, B[0], G[0], R[0], vsync, B[1], G[1], R[1]}
