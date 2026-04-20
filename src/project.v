@@ -33,10 +33,12 @@ module tt_um_kilian_waves (
     input  wire       rst_n     // reset_n - low to reset
 );
 
-  // uio[0] drives the 1-bit sigma-delta audio output; all others are inputs.
+  // uio[7] drives the 1-bit sigma-delta audio output; all others inputs.
+  // Bit 7 is the TT audio-PMOD convention — vga-playground and on-chip
+  // audio taps both read from that position.
   wire audio_out;
-  assign uio_out = {7'b0, audio_out};
-  assign uio_oe  = 8'b0000_0001;
+  assign uio_out = {audio_out, 7'b0};
+  assign uio_oe  = 8'b1000_0000;
 
   // All ui_in and uio_in bits are unused in variant F (palette hardwired white,
   // freeze/slow knobs dropped).

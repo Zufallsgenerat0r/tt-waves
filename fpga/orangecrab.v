@@ -55,8 +55,8 @@ module top (
     // Invert HSYNC[7] and VSYNC[3] for active-low VGA sync.
     assign pmod = uo_out ^ 8'b1000_1000;
 
-    // 1-bit sigma-delta audio from uio[0] → feather pin 13 (FPGA site R4).
-    assign audio = uio_out_bus[0];
+    // 1-bit sigma-delta audio from uio[7] → feather pin A5 (FPGA site A11).
+    assign audio = uio_out_bus[7];
 
     assign led_r = 1'b1;
     assign led_g = ~pll_locked;  // green when PLL locked
