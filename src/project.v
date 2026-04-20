@@ -281,12 +281,34 @@ module tt_um_kilian_waves (
     else if (pixel_ce) dot <= dot_now;  // Sample output only on pixel cycle.
   end
 
-  // --- Block D: output.
-  // Palette hardwired to white.
-  wire dot_on = display_on & dot;
-  wire [1:0] R = dot_on ? 2'b11 : 2'b00;
-  wire [1:0] G = dot_on ? 2'b11 : 2'b00;
-  wire [1:0] B = dot_on ? 2'b11 : 2'b00;
+  // --- Block D: output with Bayer-dithered haze + chromatic fringe.
+  //   Dots render solid white. Between dots, the interference wave field
+  //   is shown as a dim coloured haze:
+  //     primary band (ra_lat[10] ^ rb_lat[10]) → 50% coverage via 2x2 Bayer
+  //     finer  band  (ra_lat[9]  ^ rb_lat[9])  → 25% coverage, green only
+  //   Chromatic axis: ra_lat[10] picks warm (red) vs cool (blue) tint on
+  //   the primary-band haze. Cost: a handful of muxes, no added flops.
+  wire bayer_hi = x[0] ^ y[0];         // 50% checker
+  wire bayer_lo = x[0] & y[0];         // 25% sparse
+
+  wire wave_lo  = ra_lat[10] ^ rb_lat[10];
+  wire wave_hi  = ra_lat[9]  ^ rb_lat[9];
+  wire warm     = ra_lat[10];
+
+  wire dot_on    = display_on & dot;
+  wire haze_full = display_on & ~dot & wave_lo & bayer_hi;
+  wire haze_weak = display_on & ~dot & wave_hi & bayer_lo;
+
+  wire [1:0] R = dot_on    ? 2'b11
+               : haze_full ? (warm ? 2'b01 : 2'b00)
+               : 2'b00;
+  wire [1:0] G = dot_on    ? 2'b11
+               : haze_full ? 2'b01
+               : haze_weak ? 2'b01
+               : 2'b00;
+  wire [1:0] B = dot_on    ? 2'b11
+               : haze_full ? (warm ? 2'b00 : 2'b01)
+               : 2'b00;
 
   // TinyVGA Pmod: {hsync, B[0], G[0], R[0], vsync, B[1], G[1], R[1]}
   assign uo_out = {hsync, B[0], G[0], R[0], vsync, B[1], G[1], R[1]};
