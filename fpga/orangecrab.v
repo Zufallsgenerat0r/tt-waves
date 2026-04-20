@@ -14,7 +14,8 @@ module top (
     output wire led_r,
     output wire led_g,
     output wire led_b,
-    output wire [7:0] pmod
+    output wire [7:0] pmod,
+    output wire audio
 );
 
     wire clk_vga;
@@ -37,13 +38,15 @@ module top (
             reset_cnt <= reset_cnt - 1;
 
     wire [7:0] uo_out;
+    wire [7:0] uio_out_bus;
+    wire [7:0] uio_oe_bus;
 
     tt_um_kilian_waves demo (
         .ui_in  (8'b0000_0000),
         .uo_out (uo_out),
         .uio_in (8'h00),
-        .uio_out(),
-        .uio_oe (),
+        .uio_out(uio_out_bus),
+        .uio_oe (uio_oe_bus),
         .ena    (1'b1),
         .clk    (clk_vga),
         .rst_n  (rst_n)
@@ -51,6 +54,9 @@ module top (
 
     // Invert HSYNC[7] and VSYNC[3] for active-low VGA sync.
     assign pmod = uo_out ^ 8'b1000_1000;
+
+    // 1-bit sigma-delta audio from uio[0] → feather pin 13 (FPGA site R4).
+    assign audio = uio_out_bus[0];
 
     assign led_r = 1'b1;
     assign led_g = ~pll_locked;  // green when PLL locked

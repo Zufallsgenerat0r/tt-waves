@@ -49,3 +49,9 @@ IOBUF PORT "pmod[4]" IO_TYPE=LVCMOS33;
 IOBUF PORT "pmod[5]" IO_TYPE=LVCMOS33;
 IOBUF PORT "pmod[6]" IO_TYPE=LVCMOS33;
 IOBUF PORT "pmod[7]" IO_TYPE=LVCMOS33;
+
+# Audio output: 1-bit sigma-delta on OrangeCrab r0.2.1 feather pin A5 (FPGA site A11).
+# Solder an RC low-pass (or just a 1k resistor + audio cable) from this pin
+# to an amp/speaker.
+LOCATE COMP "audio" SITE "A11";
+IOBUF PORT "audio" IO_TYPE=LVCMOS33;

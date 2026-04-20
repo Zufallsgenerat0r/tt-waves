@@ -42,7 +42,7 @@ pinout:
   uo[7]: "HSYNC"
 
   # Bidirectional pins
-  uio[0]: ""
+  uio[0]: "audio (1-bit sigma-delta)"
   uio[1]: ""
   uio[2]: ""
   uio[3]: ""

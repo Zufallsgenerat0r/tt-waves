@@ -33,8 +33,10 @@ module tt_um_kilian_waves (
     input  wire       rst_n     // reset_n - low to reset
 );
 
-  assign uio_out = 0;
-  assign uio_oe  = 0;
+  // uio[0] drives the 1-bit sigma-delta audio output; all others are inputs.
+  wire audio_out;
+  assign uio_out = {7'b0, audio_out};
+  assign uio_oe  = 8'b0000_0001;
 
   // All ui_in and uio_in bits are unused in variant F (palette hardwired white,
   // freeze/slow knobs dropped).
@@ -322,6 +324,107 @@ module tt_um_kilian_waves (
 
   // TinyVGA Pmod: {hsync, B[0], G[0], R[0], vsync, B[1], G[1], R[1]}
   assign uo_out = {hsync, B[0], G[0], R[0], vsync, B[1], G[1], R[1]};
+
+  // =========================================================================
+  // Audio synth — 1-bit sigma-delta on uio[0].
+  //   Two voices (square-wave melody + triangle-wave bass), exponential decay
+  //   envelope on melody, bass constant-volume. Tempo and song position tick
+  //   off vsync rising edges (60 Hz base). Shares the visual's vsync cadence
+  //   so the audio and the Lissajous pointer breathe together.
+  // =========================================================================
+
+  // Song position: 8-bit counter, ticks once per vsync (60 Hz).
+  reg [7:0] song_pos;
+  always @(posedge clk) begin
+    if (~rst_n) song_pos <= 0;
+    else if (pixel_ce && vsync && !vsync_prev)
+      song_pos <= song_pos + 1;
+  end
+
+  // Note frequency table (A-minor scale, 8 notes). inc = freq × 2^16 / 50.35 MHz
+  // so that a 16-bit phase accumulator yields the right output frequency.
+  //   0: A3 220 Hz  → 286
+  //   1: C4 262 Hz  → 341
+  //   2: D4 294 Hz  → 382
+  //   3: E4 330 Hz  → 429
+  //   4: F4 349 Hz  → 454
+  //   5: G4 392 Hz  → 510
+  //   6: A4 440 Hz  → 573
+  //   7: C5 523 Hz  → 681
+  function [9:0] note_inc;
+    input [2:0] idx;
+    case (idx)
+      3'd0: note_inc = 10'd286;
+      3'd1: note_inc = 10'd341;
+      3'd2: note_inc = 10'd382;
+      3'd3: note_inc = 10'd429;
+      3'd4: note_inc = 10'd454;
+      3'd5: note_inc = 10'd510;
+      3'd6: note_inc = 10'd573;
+      3'd7: note_inc = 10'd681;
+    endcase
+  endfunction
+
+  // Melody steps every 8 vsyncs (≈ 133 ms) → ~1 s loop of 8 notes.
+  wire [2:0] melody_idx = song_pos[5:3];
+  // Bass steps every 64 vsyncs (≈ 1 s) → ~8.5 s loop of 8 notes, octave down.
+  wire [2:0] bass_idx   = song_pos[7:5];
+  wire [9:0] melody_inc   = note_inc(melody_idx);
+  wire [9:0] bass_inc_raw = note_inc(bass_idx);
+  wire [9:0] bass_inc     = {1'b0, bass_inc_raw[9:1]};  // >> 1 = octave down
+
+  // Phase accumulators (advance every clock @ 50.35 MHz).
+  reg [15:0] melody_phase;
+  reg [15:0] bass_phase;
+  always @(posedge clk) begin
+    if (~rst_n) begin
+      melody_phase <= 0;
+      bass_phase   <= 0;
+    end else begin
+      melody_phase <= melody_phase + {6'b0, melody_inc};
+      bass_phase   <= bass_phase   + {6'b0, bass_inc};
+    end
+  end
+
+  // Melody envelope: 6-bit, triggered on every 4-vsync beat, exp-decays via >>3.
+  wire beat_trigger = pixel_ce && vsync && !vsync_prev && (song_pos[1:0] == 2'b00);
+  reg [5:0] melody_env;
+  always @(posedge clk) begin
+    if (~rst_n) melody_env <= 0;
+    else if (beat_trigger) melody_env <= 6'd63;
+    else if (pixel_ce && vsync && !vsync_prev)
+      melody_env <= melody_env - (melody_env >> 3);
+  end
+
+  // Square-wave melody × envelope, signed.
+  wire signed [7:0] melody_samp = melody_phase[15]
+      ?  $signed({1'b0, melody_env, 1'b0})
+      : -$signed({1'b0, melody_env, 1'b0});
+
+  // Triangle-wave bass (constant ~64-amplitude).
+  wire [6:0] tri_up   =  bass_phase[14:8];
+  wire [6:0] tri_down = ~bass_phase[14:8];
+  wire [6:0] tri_val  = bass_phase[15] ? tri_down : tri_up;
+  wire signed [7:0] bass_samp = $signed({1'b0, tri_val}) - 8'sd64;
+
+  // Mix, shift down, shift to unsigned for the sigma-delta accumulator.
+  wire signed [8:0] mix          = melody_samp + bass_samp;
+  wire        [7:0] audio_unsign = mix[8:1] + 8'd128;
+
+  // 1-bit sigma-delta modulator (a1k0n's TT08 pattern).
+  reg        audio_out_reg;
+  reg  [7:0] sd_accum;
+  wire [8:0] sd_next = {1'b0, sd_accum} + {1'b0, audio_unsign};
+  always @(posedge clk) begin
+    if (~rst_n) begin
+      sd_accum      <= 0;
+      audio_out_reg <= 0;
+    end else begin
+      sd_accum      <= sd_next[7:0];
+      audio_out_reg <= sd_next[8];
+    end
+  end
+  assign audio_out = audio_out_reg;
 
 endmodule
 
