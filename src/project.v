@@ -5,9 +5,19 @@
  * Wave Lattice — a dot-grid port of https://taylor.town/waves (Taylor Troesh,
  * inspired by Zach Lieberman). Two interfering radial wave sources displace
  * a 40x30 dot lattice on a 640x480 VGA signal. Source A follows a virtual
- * pointer that slowly winds a spiral from screen centre outward and back;
- * source B is its point-mirror (640-x, 480-y). All logic is streaming and
- * stateless per-pixel; no frame buffer, no line buffer.
+ * Lissajous pointer; source B is its point-mirror (640-x, 480-y).
+ *
+ * Variant F: dual-source via 2× internal clock.
+ *   The internal logic runs at 2× the VGA pixel rate (50.35 MHz). A 1-bit
+ *   `phase` register splits each pixel into two internal cycles:
+ *     phase=0 — "pixel cycle": VGA timing advances, A-side state updates,
+ *               output (dot) is sampled.
+ *     phase=1 — "free cycle":  B-side state updates.
+ *   Per-pixel adders, subtractors, and predicates that used to exist
+ *   twice (once for A, once for B) are now single resources whose
+ *   operands are muxed on `phase`. Only the state registers (r1a/r1b,
+ *   r2a/r2b, ra_lat/rb_lat, sgn/far latches) remain duplicated, because
+ *   both values are read at display-time.
  */
 
 `default_nettype none
@@ -19,20 +29,33 @@ module tt_um_kilian_waves (
     output wire [7:0] uio_out,  // IOs: Output path
     output wire [7:0] uio_oe,   // IOs: Enable path (active high: 0=input, 1=output)
     input  wire       ena,      // always 1 when the design is powered, so you can ignore it
-    input  wire       clk,      // clock 25.175 MHz
+    input  wire       clk,      // clock 50.35 MHz (2× VGA pixel rate)
     input  wire       rst_n     // reset_n - low to reset
 );
 
   assign uio_out = 0;
   assign uio_oe  = 0;
 
-  wire _unused = &{ena, ui_in[7:4], uio_in, 1'b0};
+  // All ui_in and uio_in bits are unused in variant F (palette hardwired white,
+  // freeze/slow knobs dropped).
+  wire _unused = &{ena, ui_in, uio_in, 1'b0};
+
+  // --- Phase register: toggles every clock.
+  //   phase == 0 → pixel cycle (VGA advances, A updates, output samples)
+  //   phase == 1 → free cycle  (B updates)
+  reg phase;
+  always @(posedge clk) begin
+    if (~rst_n) phase <= 1'b0;
+    else        phase <= ~phase;
+  end
+  wire pixel_ce = (phase == 1'b0);
 
   wire hsync, vsync, display_on;
   wire [9:0] x, y;
 
   hvsync_generator hvsync_gen(
     .clk(clk),
+    .clken(pixel_ce),
     .reset(~rst_n),
     .hsync(hsync),
     .vsync(vsync),
@@ -41,49 +64,38 @@ module tt_um_kilian_waves (
     .vpos(y)
   );
 
-  // --- vsync rising-edge detector, shared by ptr_counter ---
+  // --- vsync rising-edge detector (only ticks on pixel cycles).
   reg vsync_prev;
   always @(posedge clk) begin
-    if (~rst_n) vsync_prev <= 0;
-    else        vsync_prev <= vsync;
+    if (~rst_n)           vsync_prev <= 0;
+    else if (pixel_ce)    vsync_prev <= vsync;
   end
 
-  // --- Pointer counter: gated by ui_in[2] to freeze the spiral ---
+  // --- Pointer counter (advances once per VGA frame).
   reg [11:0] ptr_counter;
   always @(posedge clk) begin
     if (~rst_n)
       ptr_counter <= 0;
-    else if (vsync && !vsync_prev && !ui_in[2])
+    else if (pixel_ce && vsync && !vsync_prev)
       ptr_counter <= ptr_counter + 1;
   end
 
-  // --- Block 0: Lissajous virtual pointer ---
-  // Multiplier-free trajectory: two independent triangle waves at coprime
-  // frequencies (3:5) drive x and y. Constant-coefficient multiplies fold
-  // to wire+add, so the whole pointer pipeline contains no DSP cells.
-  // Full Lissajous cycle = 1024 frames ≈ 17 s at 60 Hz; ui_in[3] halves
-  // the rate (≈ 34 s cycle).
+  // --- Lissajous virtual pointer (multiplier-free, 3:5 coprime ratio).
   wire [13:0] pc3 = {ptr_counter, 1'b0} + {2'b00, ptr_counter};   // 3 × pc
   wire [14:0] pc5 = {ptr_counter, 2'b00} + {3'b000, ptr_counter}; // 5 × pc
 
-  wire [9:0] px_raw = ui_in[3] ? pc3[10:1] : pc3[9:0];
-  wire [9:0] py_raw = ui_in[3] ? pc5[10:1] : pc5[9:0];
+  wire [9:0] px_raw = pc3[9:0];
+  wire [9:0] py_raw = pc5[9:0];
 
-  // Fold each into a 0..511..0 triangle.
   wire [8:0] px_tri = px_raw[9] ? (9'd511 - px_raw[8:0]) : px_raw[8:0];
   wire [8:0] py_tri = py_raw[9] ? (9'd511 - py_raw[8:0]) : py_raw[8:0];
 
-  // Signed amplitude in [-64, +63]; computed in 10-bit signed throughout
-  // so the subtraction stays signed (Verilog concats are unsigned and
-  // would silently demote a left-shift trick).
   wire signed [9:0] offset_x = $signed({3'b000, px_tri[8:2]}) - 10'sd64;
   wire signed [9:0] offset_y = $signed({3'b000, py_tri[8:2]}) - 10'sd64;
 
   wire signed [9:0] ptr_x_raw = 10'sd320 + offset_x;  // [256, 383]
   wire signed [9:0] ptr_y_raw = 10'sd240 + offset_y;  // [176, 303]
 
-  // Clamps guard the hblank fix-up counter (|offset| ≤ 64 fits in ≤ 64 of
-  // 159 hblank cycles). Never fire during normal operation.
   wire signed [9:0]  ptr_x = (ptr_x_raw < 10'sd256) ? 10'sd256
                            : (ptr_x_raw > 10'sd383) ? 10'sd383
                            : ptr_x_raw;
@@ -96,25 +108,67 @@ module tt_um_kilian_waves (
   wire signed [9:0] center_ay = ptr_y;
   wire signed [9:0] center_bx = 10'sd640 - ptr_x;
   wire signed [9:0] center_by = 10'sd480 - ptr_y;
-  wire signed [9:0] p_ax = x - center_ax;
-  wire signed [9:0] p_ay = y - center_ay;
-  wire signed [9:0] p_bx = x - center_bx;
-  wire signed [9:0] p_by = y - center_by;
 
-  // --- Distance-squared accumulators (two sources) ---
-  // Narrowed accumulators; phase-bit extraction is tolerant of modular wrap.
+  // --- Time-muxed pixel-to-centre subtractors (p_?x, p_?y).
+  // One shared x-subtractor, operand muxed by phase; same for y.
+  wire signed [9:0] center_cur_x = phase ? center_bx : center_ax;
+  wire signed [9:0] center_cur_y = phase ? center_by : center_ay;
+  wire signed [9:0] p_cur_x = x - center_cur_x;  // = p_ax on phase=0, p_bx on phase=1
+  wire signed [9:0] p_cur_y = y - center_cur_y;  // = p_ay on phase=0, p_by on phase=1
+
+  // --- Distance-squared accumulators (dual state, still two of each).
   reg [13:0] r1a, r1b;
   reg [13:0] r2a, r2b;
-  wire [14:0] ra = {r1a, 1'b0} + {1'b0, r2a};
-  wire [14:0] rb = {r1b, 1'b0} + {1'b0, r2b};
 
-  // Offset relative to screen centre, used by the hblank fix-up branch.
-  // |offset| bounded to ≤ 64 via the ptr_x clamp above (Lissajous amp).
+  // --- Time-muxed r = 2·r1 + r2.
+  // Selects A on phase=0, B on phase=1 — same adder, different operands.
+  wire [13:0] r1_sel = phase ? r1b : r1a;
+  wire [13:0] r2_sel = phase ? r2b : r2a;
+  wire [14:0] r_sel  = {r1_sel, 1'b0} + {1'b0, r2_sel};
+
+  // --- Time-muxed "far-from-axis" predicates.
+  // One x-predicate, one y-predicate, each reading p_cur_* which is
+  // itself muxed. On phase=0 produces far_ax/far_ay; on phase=1 far_bx/far_by.
+  wire p_cur_x_far = ~((&p_cur_x[9:4]) | (~|p_cur_x[9:4]));
+  wire p_cur_y_far = ~((&p_cur_y[9:4]) | (~|p_cur_y[9:4]));
+
+  // --- Hblank fix-up operands (per-source, derived combinationally).
   wire signed [9:0] offset_ax = center_ax - 10'sd320;
   wire signed [9:0] offset_bx = center_bx - 10'sd320;
   wire [9:0] abs_off_ax = offset_ax[9] ? (10'd0 - offset_ax) : offset_ax;
   wire [9:0] abs_off_bx = offset_bx[9] ? (10'd0 - offset_bx) : offset_bx;
 
+  // Time-muxed hblank walk operands.
+  wire signed [9:0] offset_cur   = phase ? offset_bx   : offset_ax;
+  wire        [9:0] abs_off_cur  = phase ? abs_off_bx  : abs_off_ax;
+
+  // --- r1 update delta (single adder shared for x==0 case).
+  // 2·p_cur_y - 1 on either phase (A on phase=0, B on phase=1).
+  wire [13:0] r1_delta   = {{3{p_cur_y[9]}}, p_cur_y, 1'b0} - 14'd1;
+  wire [13:0] r1_sel_new = r1_sel + r1_delta;
+
+  // --- r2 update delta for display (1-step: 2·p + 1).
+  wire [13:0] r2_delta_disp = {{3{p_cur_x[9]}}, p_cur_x, 1'b0} + 14'd1;
+  wire [13:0] r2_sel_new    = r2_sel + r2_delta_disp;
+
+  // --- r2 update delta for hblank walk (±640 + offset_cur).
+  // Use full 14-bit arithmetic; operands are small enough to fit.
+  wire [13:0] hblank_add = 14'd640 + {{4{offset_cur[9]}}, offset_cur};
+  wire [13:0] hblank_sub = 14'd640 - {{4{offset_cur[9]}}, offset_cur};
+  wire [13:0] r2_sel_new_hblank = offset_cur[9] ? (r2_sel - hblank_sub)
+                                                : (r2_sel + hblank_add);
+  wire hblank_walk_active = (x - 10'd641) < abs_off_cur;
+
+  // --- r1 seed walk (y==0 line).
+  // At y==0, r1 accumulates center_cur_y into r1_sel for each x < center_cur_y.
+  wire [13:0] r1_seed_new    = r1_sel + {{4{1'b0}}, center_cur_y};
+  wire        r1_seed_active = (x < center_cur_y);
+
+  // --- Accumulator updates.
+  // Per-phase write-back routes r?_sel_new into either r?a or r?b.
+  // The if/else-if chain mirrors the single-source form; the only change
+  // is that a single phase-muxed resource feeds whichever accumulator the
+  // current phase selects (phase=0 → A, phase=1 → B).
   always @(posedge clk) begin
     if (~rst_n) begin
       r1a <= 0; r2a <= 0;
@@ -123,66 +177,51 @@ module tt_um_kilian_waves (
       if (vsync) begin
         r1a <= 0; r2a <= 0;
         r1b <= 0; r2b <= 0;
-      end
-
-      if (display_on & y == 0) begin
-        if (x < center_ay) r1a <= r1a + center_ay;
-        if (x < center_by) r1b <= r1b + center_by;
-      end else if (x == 640) begin
-        // r2a: seed = 320² mod 2¹⁴ = 4096; walk produces cax² for x=0 use.
-        // r2b: seed = 319² mod 2¹⁴ = 3457; walk uses 638 (not 640) so the
-        // result is (1-cbx)² mod 2¹⁴ — the predecessor state the time-muxed
-        // 2-step delta formula needs (r2b first updates at even x=2).
-        r2a <= 14'd4096;
-        r2b <= 14'd3457;
-      end else if (x > 640) begin
-        // Hblank walk. r2a → cax², r2b → (1-cbx)². With Lissajous |offset|
-        // ≤ 64, the walk uses ≤ 64 of the 159 hblank cycles available.
-        if (offset_ax[9] == 1'b0 && (x - 10'd641) < abs_off_ax)
-          r2a <= r2a + 19'sd640 + offset_ax;
-        else if (offset_ax[9] == 1'b1 && (x - 10'd641) < abs_off_ax)
-          r2a <= r2a - (19'sd640 + offset_ax);
-        if (offset_bx[9] == 1'b0 && (x - 10'd641) < abs_off_bx)
-          r2b <= r2b + 19'sd638 + offset_bx;
-        else if (offset_bx[9] == 1'b1 && (x - 10'd641) < abs_off_bx)
-          r2b <= r2b - (19'sd638 + offset_bx);
-      end else if (display_on & x == 0) begin
-        // Delta uses 2*(Y-1-cy)+1 = 2*p_ay-1 because y has already
-        // advanced to Y when this update fires at x==0.
-        r1a <= r1a + 2*p_ay - 1;
-        r1b <= r1b + 2*p_by - 1;
+      end else if (display_on && y == 10'd0) begin
+        // y==0 line: r1 accumulates center_y for columns x < center_y.
+        if (r1_seed_active) begin
+          if (phase == 1'b0) r1a <= r1_seed_new;
+          else               r1b <= r1_seed_new;
+        end
+      end else if (x == 10'd640) begin
+        // End of line: seed r2 = 320² mod 2¹⁴ = 4096. No A/B skew in this
+        // variant (the display-time r2 update uses the 1-step delta, not
+        // the 2-step trick), so both sources use the same clean seed.
+        if (phase == 1'b0) r2a <= 14'd4096;
+        else               r2b <= 14'd4096;
+      end else if (x > 10'd640) begin
+        // Hblank walk: advance r2_sel toward c?x² (the starting value for
+        // the per-line x walk). Runs on both phases with muxed operands.
+        if (hblank_walk_active) begin
+          if (phase == 1'b0) r2a <= r2_sel_new_hblank;
+          else               r2b <= r2_sel_new_hblank;
+        end
+      end else if (display_on && x == 10'd0) begin
+        // r1 update at start of new visible line. Delta = 2·p_cur_y - 1
+        // because y has already advanced to the new row.
+        if (phase == 1'b0) r1a <= r1_sel_new;
+        else               r1b <= r1_sel_new;
       end else if (display_on) begin
-        // Time-muxed r2 update: one shared 14-bit adder, parity routes the
-        // write. r2a updates at odd x (1,3,…,15,…) starting cleanly from
-        // cax²; r2b updates at even x (2,4,…) starting from (1-cbx)² (set
-        // by the modified hblank walk above). Both use the 2-step delta
-        // 4·p (since each accumulator advances by 2 px between updates).
-        // Net: A is 1 px stale at latch time (x=15), B is fresh — 6 % of
-        // a cell width, expected invisible.
-        if (x[0] == 1'b1)
-          r2a <= r2a + {{2{p_ax[9]}}, p_ax, 2'b00};
-        else
-          r2b <= r2b + {{2{p_bx[9]}}, p_bx, 2'b00};
+        // Display-time r2 update: standard 1-step delta 2·p_cur_x + 1.
+        // Both sources fresh every pixel — no inter-source skew.
+        if (phase == 1'b0) r2a <= r2_sel_new;
+        else               r2b <= r2_sel_new;
       end
     end
   end
 
-  // "Far-from-axis" predicates: true when the dot is at least 16 px off the
-  // source's x or y line. Used to damp on-axis displacement so dots sitting
-  // at y=center_ay don't get full vertical push (silicon analog of the
-  // JS normalized `dy/d` scaling — approximated as a binary gate here).
-  wire p_ax_far = ~((&p_ax[9:4]) | (~|p_ax[9:4]));
-  wire p_ay_far = ~((&p_ay[9:4]) | (~|p_ay[9:4]));
-  wire p_bx_far = ~((&p_bx[9:4]) | (~|p_bx[9:4]));
-  wire p_by_far = ~((&p_by[9:4]) | (~|p_by[9:4]));
-
-  // --- Block A: lattice anchor latches ---
-  // Fire on last pixel of each 16-wide cell (x[3:0]==4'hF), AND on x==639 so
-  // column 0 of the next scanline isn't still carrying the previous line's
-  // values after the y accumulator has stepped.
+  // --- Block A: lattice anchor latches.
+  // Both A and B latches update on the SAME VGA pixel; the phase splits
+  // writes so each latch captures the freshly-computed r_sel for its source.
   reg [11:0] ra_lat, rb_lat;
   reg sgn_ax_lat, sgn_ay_lat, sgn_bx_lat, sgn_by_lat;
   reg far_ax_lat, far_ay_lat, far_bx_lat, far_by_lat;
+
+  // Latch condition in VGA-pixel terms (last pixel of each 16-wide cell,
+  // plus x==639). VGA signals only update on phase=0, so x is stable
+  // across both phases of that pixel.
+  wire latch_en = display_on && (x[3:0] == 4'hF || x == 10'd639);
+
   always @(posedge clk) begin
     if (~rst_n) begin
       ra_lat <= 0; rb_lat <= 0;
@@ -190,30 +229,32 @@ module tt_um_kilian_waves (
       sgn_bx_lat <= 0; sgn_by_lat <= 0;
       far_ax_lat <= 0; far_ay_lat <= 0;
       far_bx_lat <= 0; far_by_lat <= 0;
-    end else if (display_on && (x[3:0] == 4'hF || x == 10'd639)) begin
-      ra_lat <= ra[14:3];
-      rb_lat <= rb[14:3];
-      sgn_ax_lat <= p_ax[9];
-      sgn_ay_lat <= p_ay[9];
-      sgn_bx_lat <= p_bx[9];
-      sgn_by_lat <= p_by[9];
-      far_ax_lat <= p_ax_far;
-      far_ay_lat <= p_ay_far;
-      far_bx_lat <= p_bx_far;
-      far_by_lat <= p_by_far;
+    end else if (latch_en) begin
+      if (phase == 1'b0) begin
+        // Source A cycle.
+        ra_lat     <= r_sel[14:3];
+        sgn_ax_lat <= p_cur_x[9];
+        sgn_ay_lat <= p_cur_y[9];
+        far_ax_lat <= p_cur_x_far;
+        far_ay_lat <= p_cur_y_far;
+      end else begin
+        // Source B cycle.
+        rb_lat     <= r_sel[14:3];
+        sgn_bx_lat <= p_cur_x[9];
+        sgn_by_lat <= p_cur_y[9];
+        far_bx_lat <= p_cur_x_far;
+        far_by_lat <= p_cur_y_far;
+      end
     end
   end
 
-  // --- Block B: signed displacement decode ---
-  // ra_lat[10] is the sign (alternates across radial ridges — the
-  // tanh(sharp·sin) behaviour in silicon form); ra_lat[9:8] is 0..3 magnitude.
-  // Axis direction on top of that from the latched p_ax/p_ay sign.
+  // --- Block B: signed displacement decode.
+  // Kept combinational (mirrors the original) to avoid a 1-pixel lag
+  // between latch and display. Two 3-bit negates (one per source) are
+  // cheap; the big-ticket savings are the time-muxed adders above.
   wire signed [2:0] disp_a = ra_lat[10] ? -{1'b0, ra_lat[9:8]} : {1'b0, ra_lat[9:8]};
   wire signed [2:0] disp_b = rb_lat[10] ? -{1'b0, rb_lat[9:8]} : {1'b0, rb_lat[9:8]};
 
-  // Zero the axis component when the dot is within 16 px of that source axis.
-  // This replaces the hard sign flip at y=center_ay with a 32-px-wide band of
-  // undisplaced dots, hiding the seam without a divider.
   wire signed [3:0] dlx_a = far_ax_lat ? (sgn_ax_lat ? -{disp_a[2], disp_a} : {disp_a[2], disp_a}) : 4'sd0;
   wire signed [3:0] dly_a = far_ay_lat ? (sgn_ay_lat ? -{disp_a[2], disp_a} : {disp_a[2], disp_a}) : 4'sd0;
   wire signed [3:0] dlx_b = far_bx_lat ? (sgn_bx_lat ? -{disp_b[2], disp_b} : {disp_b[2], disp_b}) : 4'sd0;
@@ -222,7 +263,6 @@ module tt_um_kilian_waves (
   wire signed [4:0] dlx_sum = dlx_a + dlx_b;
   wire signed [4:0] dly_sum = dly_a + dly_b;
 
-  // Saturate to ±6 so a dot cannot cross into a neighbour cell.
   wire signed [3:0] dlx = (dlx_sum >  5'sd6) ?  4'sd6
                         : (dlx_sum < -5'sd6) ? -4'sd6
                         : dlx_sum[3:0];
@@ -230,25 +270,23 @@ module tt_um_kilian_waves (
                         : (dly_sum < -5'sd6) ? -4'sd6
                         : dly_sum[3:0];
 
-  // --- Block C: dot mask, pipelined ---
-  // 16-pixel lattice spacing; dot centre at local (8,8); Chebyshev radius 2.
+  // --- Block C: dot mask, pipelined.
   wire signed [5:0] ex = $signed({2'b00, x[3:0]}) - 6'sd8 - {{2{dlx[3]}}, dlx};
   wire signed [5:0] ey = $signed({2'b00, y[3:0]}) - 6'sd8 - {{2{dly[3]}}, dly};
   wire dot_now = (ex >= -6'sd2 && ex <= 6'sd2 &&
                   ey >= -6'sd2 && ey <= 6'sd2);
   reg dot;
   always @(posedge clk) begin
-    if (~rst_n) dot <= 0;
-    else dot <= dot_now;
+    if (~rst_n)        dot <= 0;
+    else if (pixel_ce) dot <= dot_now;  // Sample output only on pixel cycle.
   end
 
-  // --- Block D: output ---
-  // Palette variants: 00=white, 01=no-red(cyan), 10=no-green(magenta), 11=no-blue(yellow).
-  wire [1:0] palette = ui_in[1:0];
+  // --- Block D: output.
+  // Palette hardwired to white.
   wire dot_on = display_on & dot;
-  wire [1:0] R = dot_on ? (palette == 2'b01 ? 2'b00 : 2'b11) : 2'b00;
-  wire [1:0] G = dot_on ? (palette == 2'b10 ? 2'b00 : 2'b11) : 2'b00;
-  wire [1:0] B = dot_on ? (palette == 2'b11 ? 2'b00 : 2'b11) : 2'b00;
+  wire [1:0] R = dot_on ? 2'b11 : 2'b00;
+  wire [1:0] G = dot_on ? 2'b11 : 2'b00;
+  wire [1:0] B = dot_on ? 2'b11 : 2'b00;
 
   // TinyVGA Pmod: {hsync, B[0], G[0], R[0], vsync, B[1], G[1], R[1]}
   assign uo_out = {hsync, B[0], G[0], R[0], vsync, B[1], G[1], R[1]};
@@ -256,10 +294,11 @@ module tt_um_kilian_waves (
 endmodule
 
 
-// VGA 640x480 @ 60Hz sync generator
-// Proven in silicon (tt08-vga-drop by ReJ/Renaldas Zioma)
-module hvsync_generator(clk, reset, hsync, vsync, display_on, hpos, vpos);
+// VGA 640x480 @ 60Hz sync generator, clock-enable variant.
+// Internal logic runs at 2× pixel rate; hvsync advances only when clken=1.
+module hvsync_generator(clk, clken, reset, hsync, vsync, display_on, hpos, vpos);
     input clk;
+    input clken;
     input reset;
     output reg hsync, vsync;
     output display_on;
@@ -287,21 +326,25 @@ module hvsync_generator(clk, reset, hsync, vsync, display_on, hpos, vpos);
 
     always @(posedge clk)
     begin
-      hsync <= (hpos>=H_SYNC_START && hpos<=H_SYNC_END);
-      if(hmaxxed)
-        hpos <= 0;
-      else
-        hpos <= hpos + 1;
+      if (clken) begin
+        hsync <= (hpos>=H_SYNC_START && hpos<=H_SYNC_END);
+        if(hmaxxed)
+          hpos <= 0;
+        else
+          hpos <= hpos + 1;
+      end
     end
 
     always @(posedge clk)
     begin
-      vsync <= (vpos>=V_SYNC_START && vpos<=V_SYNC_END);
-      if(hmaxxed)
-        if (vmaxxed)
-          vpos <= 0;
-        else
-          vpos <= vpos + 1;
+      if (clken) begin
+        vsync <= (vpos>=V_SYNC_START && vpos<=V_SYNC_END);
+        if(hmaxxed)
+          if (vmaxxed)
+            vpos <= 0;
+          else
+            vpos <= vpos + 1;
+      end
     end
 
     assign display_on = (hpos<H_DISPLAY) && (vpos<V_DISPLAY);
