@@ -161,11 +161,15 @@ module tt_um_kilian_waves (
   wire [13:0] r2_delta_disp = {{3{p_cur_x[9]}}, p_cur_x, 1'b0} + 14'd1;
   wire [13:0] r2_sel_new    = r2_sel + r2_delta_disp;
 
-  // --- r2 update delta for hblank walk (±640 + offset_cur).
-  // Use full 14-bit arithmetic; operands are small enough to fit.
+  // --- r2 update delta for hblank walk: always (640 + offset_cur).
+  // For offset >= 0: r2 += (640 + |offset|). For offset < 0:
+  // r2 -= (640 − |offset|) (same as subtracting (640 + offset_cur)).
+  // The previous hblank_sub = 640 − offset_cur was wrong: for negative
+  // offset that evaluates to (640 + |offset|), subtracting too much and
+  // flipping bit 13 of r2 at full Lissajous amplitude (|offset|=64 →
+  // cumulative error 2·64² = 8192 = half of 2¹⁴).
   wire [13:0] hblank_add = 14'd640 + {{4{offset_cur[9]}}, offset_cur};
-  wire [13:0] hblank_sub = 14'd640 - {{4{offset_cur[9]}}, offset_cur};
-  wire [13:0] r2_sel_new_hblank = offset_cur[9] ? (r2_sel - hblank_sub)
+  wire [13:0] r2_sel_new_hblank = offset_cur[9] ? (r2_sel - hblank_add)
                                                 : (r2_sel + hblank_add);
   wire hblank_walk_active = (x - 10'd641) < abs_off_cur;
 
