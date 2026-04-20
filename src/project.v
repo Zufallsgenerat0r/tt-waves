@@ -186,8 +186,10 @@ module tt_um_kilian_waves (
         else if (offset_bx[9] == 1'b1 && (x - 10'd641) < abs_off_bx)
           r2b <= r2b - (19'sd640 + offset_bx);
       end else if (display_on & x == 0) begin
-        r1a <= r1a + 2*p_ay + 1;
-        r1b <= r1b + 2*p_by + 1;
+        // Delta uses 2*(Y-1-cy)+1 = 2*p_ay-1 because y has already
+        // advanced to Y when this update fires at x==0.
+        r1a <= r1a + 2*p_ay - 1;
+        r1b <= r1b + 2*p_by - 1;
       end else if (display_on) begin
         r2a <= r2a + 2*p_ax + 1;
         r2b <= r2b + 2*p_bx + 1;
