@@ -71,12 +71,22 @@ module tt_um_kilian_waves (
     else if (pixel_ce)    vsync_prev <= vsync;
   end
 
-  // --- Pointer counter (advances once per VGA frame).
+  // --- Frame divider: advance ptr_counter once every 10 vsyncs for
+  //   ~10x slower Lissajous motion (≈ 170 s full cycle vs. ≈ 17 s).
+  reg [3:0] frame_div;
+  always @(posedge clk) begin
+    if (~rst_n) frame_div <= 0;
+    else if (pixel_ce && vsync && !vsync_prev)
+      frame_div <= (frame_div == 4'd9) ? 4'd0 : frame_div + 4'd1;
+  end
+  wire ptr_tick = pixel_ce && vsync && !vsync_prev && (frame_div == 4'd9);
+
+  // --- Pointer counter (advances once every 10 VGA frames).
   reg [11:0] ptr_counter;
   always @(posedge clk) begin
     if (~rst_n)
       ptr_counter <= 0;
-    else if (pixel_ce && vsync && !vsync_prev)
+    else if (ptr_tick)
       ptr_counter <= ptr_counter + 1;
   end
 
