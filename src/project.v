@@ -41,22 +41,14 @@ module tt_um_kilian_waves (
     .vpos(y)
   );
 
-  // --- Frame counter (increments once per frame on vsync rising edge) ---
-  reg [11:0] frame_counter;
+  // --- vsync rising-edge detector, shared by ptr_counter ---
   reg vsync_prev;
   always @(posedge clk) begin
-    if (~rst_n) begin
-      frame_counter <= 0;
-      vsync_prev <= 0;
-    end else begin
-      vsync_prev <= vsync;
-      if (vsync && !vsync_prev)
-        frame_counter <= frame_counter + 1;
-    end
+    if (~rst_n) vsync_prev <= 0;
+    else        vsync_prev <= vsync;
   end
 
-  // --- Pointer counter: separate from frame_counter so ui_in[2] can freeze
-  //     the spiral without stopping internal animation. ---
+  // --- Pointer counter: gated by ui_in[2] to freeze the spiral ---
   reg [11:0] ptr_counter;
   always @(posedge clk) begin
     if (~rst_n)
