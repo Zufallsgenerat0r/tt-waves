@@ -46,12 +46,16 @@ PRESETS: dict[str, dict] = {
                              breath=True, breath_shift=3, breath_floor=4,
                              dual_color=True, palette_b_offset=8,
                              morph=True, morph_shift=4),
+    # pattern_shift=6 gives 64f/mode = 1s, 256f/cycle. morph_shift=4 gives 512f
+    # triangle. 2:1 ratio — pattern cycles twice per morph cycle so each mode
+    # (0..3) pairs with two different morph phases per preview, and the 1s mode
+    # dwell lets the eye register each one.
     "morph-full":      dict(mode="morph", bright_lsb=9, bright_bits=3,
                              palette_auto=True, palette_shift=6,
                              breath=True, breath_shift=3, breath_floor=4,
                              dual_color=True, palette_b_offset=8,
                              morph=True, morph_shift=4,
-                             pattern_auto=True, pattern_shift=7),
+                             pattern_auto=True, pattern_shift=6),
     "cells11":    dict(mode="cells", bright_lsb=9, bright_bits=3),
 }
 
