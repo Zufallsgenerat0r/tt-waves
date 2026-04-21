@@ -11,7 +11,7 @@
 # pipeline shifts the per-cell latch; visual parity is the contract).
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import numpy as np
 
 W, H = 640, 480
@@ -23,7 +23,11 @@ MASK15 = 0x7FFF
 
 @dataclass
 class Params:
-    palette: int = 0          # 0=white, 1=cyan, 2=magenta, 3=yellow
+    palette: int = 0          # 0=white, 1=cyan, 2=magenta, 3=yellow (manual)
+    palette_auto: bool = False  # derive palette from frame counter instead
+    palette_shift: int = 6      # ptr_counter >> shift → palette index
+    palette_dither: bool = True # 4x4 Bayer dither between adjacent palette entries
+    _blend_phase: int = 0       # internal: current 0..15 Bayer phase for this frame
     slow: bool = False        # ui_in[3]: halves Lissajous rate
     clip_to_cell: bool = True # Verilog clips dots at 16-px cell boundary
 
@@ -143,6 +147,31 @@ def compute_displacements(cax: int, cay: int, p: Params) -> tuple[np.ndarray, np
     return dlx, dly
 
 
+# 16-step hue cycle — each step changes exactly one channel by one level,
+# so transitions never visibly jump. Pure anchor colours (white/cyan/blue/
+# magenta) each get a one-step dwell for visibility. Per channel we carry
+# 2-bit gain (0..3) that scales wave amplitude; in Verilog this is a 16-entry
+# LUT plus one 2x2 multiplier per channel (~30 gates total).
+HUE_PALETTE_2B: list[tuple[int, int, int]] = [
+    (3, 3, 3),  # 0  white
+    (3, 3, 3),  # 1  (dwell)
+    (2, 3, 3),  # 2
+    (1, 3, 3),  # 3
+    (0, 3, 3),  # 4  cyan
+    (0, 2, 3),  # 5
+    (0, 1, 3),  # 6
+    (0, 0, 3),  # 7  blue
+    (0, 0, 3),  # 8  (dwell)
+    (1, 0, 3),  # 9
+    (2, 0, 3),  # 10
+    (3, 0, 3),  # 11 magenta
+    (3, 0, 3),  # 12 (dwell)
+    (3, 1, 3),  # 13
+    (3, 2, 3),  # 14
+    (3, 3, 3),  # 15 back to white
+]
+
+# Legacy 4-way palette retained for dots/cells modes that want hard-coded tints.
 def _palette_rgb(palette: int) -> tuple[int, int, int]:
     if palette == 1:
         return (0, 255, 255)
@@ -151,6 +180,22 @@ def _palette_rgb(palette: int) -> tuple[int, int, int]:
     if palette == 3:
         return (255, 255, 0)
     return (255, 255, 255)
+
+
+def _palette_gain_2b(idx: int) -> tuple[int, int, int]:
+    return HUE_PALETTE_2B[idx % len(HUE_PALETTE_2B)]
+
+
+# 4x4 Bayer matrix, values 0..15. Each pixel gets a spatial threshold; over
+# a 16-step blend phase, the fraction of pixels on the "next" palette grows by
+# one per phase step — the eye reads this as a continuous fade, not a flash.
+_BAYER4 = np.array(
+    [[ 0,  8,  2, 10],
+     [12,  4, 14,  6],
+     [ 3, 11,  1,  9],
+     [15,  7, 13,  5]],
+    dtype=np.int32,
+)
 
 
 def _bright_from_lat(lat: np.ndarray, p: Params) -> np.ndarray:
@@ -164,10 +209,33 @@ def _bright_from_lat(lat: np.ndarray, p: Params) -> np.ndarray:
     return val.astype(np.int32)
 
 
+def _effective_palette(ptr_counter: int, p: Params) -> int:
+    if not p.palette_auto:
+        return p.palette
+    # 16-entry hue ring (4-bit index) when auto — narrow steps read as smooth.
+    return (ptr_counter >> p.palette_shift) & 0xF
+
+
+def _palette_blend_phase(ptr_counter: int, p: Params) -> int:
+    """0..15 sub-step phase within the current palette dwell — drives Bayer dither."""
+    if not p.palette_auto or not p.palette_dither:
+        return 0
+    # Lower 4 bits of the frame counter shifted by (palette_shift - 4).
+    lo = max(0, p.palette_shift - 4)
+    return (ptr_counter >> lo) & 0xF
+
+
 def render_frame(ptr_counter: int, p: Params | None = None) -> np.ndarray:
     if p is None:
         p = Params()
+    # Resolve auto-cycled palette for this frame. Stash blend state on params so
+    # the pixel-level renderers can apply the Bayer dither between entries.
+    pal_idx = _effective_palette(ptr_counter, p)
+    blend_phase = _palette_blend_phase(ptr_counter, p)
+    auto = p.palette_auto
+    p = replace(p, palette=pal_idx, palette_auto=auto)
     cax, cay = compute_pointer(ptr_counter, p)
+    p = replace(p, _blend_phase=blend_phase)
 
     if p.mode == "cells":
         return _render_cells(cax, cay, p)
@@ -290,19 +358,40 @@ def _render_pixel_phase_dots(cax: int, cay: int, p: Params) -> np.ndarray:
     ey = local_y - 8
     dot_mask = (np.abs(ex) <= p.dot_r) & (np.abs(ey) <= p.dot_r)
 
-    # Brightness = level directly, with a minimum floor so the lattice is always
-    # visible even in wave troughs. Quantised to the 4-level VGA palette so the
+    # Brightness = level directly, quantised to the 4 VGA levels (0..3) so the
     # preview matches what 6-bit TinyVGA will actually emit.
     vga_level = (level * 3) // mask if mask > 0 else 3 * dot_mask.astype(np.int32)
     if p.bright_floor > 0:
         vga_level = np.maximum(vga_level, p.bright_floor)
     vga_level = np.where(dot_mask, vga_level, 0)
-    vga_intensity = (vga_level * 85).astype(np.int32)  # 0, 85, 170, 255
 
-    r, g, b = _palette_rgb(p.palette)
-    frame = np.stack([(vga_intensity * r // 255).astype(np.uint8),
-                      (vga_intensity * g // 255).astype(np.uint8),
-                      (vga_intensity * b // 255).astype(np.uint8)], axis=-1)
+    # Palette mixes via per-channel 2-bit gain (0..3) × amplitude (0..3) >> 2.
+    # Auto-cycle picks a 16-entry hue ring; Bayer dither blends into the *next*
+    # entry over 16 phase sub-steps so the fade is continuous per-pixel.
+    if p.palette_auto:
+        rg_a, gg_a, bg_a = _palette_gain_2b(p.palette)
+        rg_b, gg_b, bg_b = _palette_gain_2b(p.palette + 1)
+        if p.palette_dither:
+            tile_y = np.arange(H)[:, None] & 3
+            tile_x = np.arange(W)[None, :] & 3
+            threshold = _BAYER4[tile_y, tile_x]  # (H, W), 0..15
+            pick_b = (threshold < p._blend_phase)
+            rg = np.where(pick_b, rg_b, rg_a).astype(np.int32)
+            gg = np.where(pick_b, gg_b, gg_a).astype(np.int32)
+            bg = np.where(pick_b, bg_b, bg_a).astype(np.int32)
+        else:
+            rg, gg, bg = rg_a, gg_a, bg_a
+    else:
+        legacy = {0: (3, 3, 3), 1: (0, 3, 3), 2: (3, 0, 3), 3: (3, 3, 0)}
+        rg, gg, bg = legacy.get(p.palette, (3, 3, 3))
+
+    # Channel output = (vga_level * channel_gain) / 3 → still 0..3, then *85 → 0..255.
+    r_out = (vga_level * rg) // 3
+    g_out = (vga_level * gg) // 3
+    b_out = (vga_level * bg) // 3
+    frame = np.stack([(r_out * 85).astype(np.uint8),
+                      (g_out * 85).astype(np.uint8),
+                      (b_out * 85).astype(np.uint8)], axis=-1)
     return frame
 
 
