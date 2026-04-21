@@ -27,6 +27,9 @@ PRESETS: dict[str, dict] = {
     "pixeldots-floor": dict(mode="pixeldots", bright_lsb=9, bright_bits=3, bright_floor=1),
     "pixeldots-cycle": dict(mode="pixeldots", bright_lsb=9, bright_bits=3, bright_floor=0,
                              palette_auto=True, palette_shift=6),
+    "pixeldots-breath": dict(mode="pixeldots", bright_lsb=9, bright_bits=3, bright_floor=0,
+                              palette_auto=True, palette_shift=6,
+                              breath=True, breath_shift=3, breath_floor=4),
     "cells11":    dict(mode="cells", bright_lsb=9, bright_bits=3),
 }
 

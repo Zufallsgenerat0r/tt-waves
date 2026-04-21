@@ -28,6 +28,12 @@ class Params:
     palette_shift: int = 6      # ptr_counter >> shift → palette index
     palette_dither: bool = True # 4x4 Bayer dither between adjacent palette entries
     _blend_phase: int = 0       # internal: current 0..15 Bayer phase for this frame
+
+    # "Breathing" envelope — slow triangle wave on overall intensity.
+    breath: bool = False
+    breath_shift: int = 5       # ptr_counter bits driving the 4-bit phase
+    breath_floor: int = 4       # 0..15 min envelope so trough doesn't go fully black
+    _breath_env: int = 15       # internal: this frame's envelope 0..15
     slow: bool = False        # ui_in[3]: halves Lissajous rate
     clip_to_cell: bool = True # Verilog clips dots at 16-px cell boundary
 
@@ -225,6 +231,16 @@ def _palette_blend_phase(ptr_counter: int, p: Params) -> int:
     return (ptr_counter >> lo) & 0xF
 
 
+def _breath_envelope(ptr_counter: int, p: Params) -> int:
+    """Triangle-wave 'breath' envelope 0..15 (floored to breath_floor) — slow
+    pulse on overall intensity. Verilog cost: triangle-fold a 5-bit counter."""
+    if not p.breath:
+        return 15
+    raw = (ptr_counter >> p.breath_shift) & 0x1F  # 5 bits → 0..31
+    env = raw if (raw & 0x10) == 0 else (31 - raw)  # triangle 0..15..0
+    return max(env, p.breath_floor)
+
+
 def render_frame(ptr_counter: int, p: Params | None = None) -> np.ndarray:
     if p is None:
         p = Params()
@@ -235,7 +251,8 @@ def render_frame(ptr_counter: int, p: Params | None = None) -> np.ndarray:
     auto = p.palette_auto
     p = replace(p, palette=pal_idx, palette_auto=auto)
     cax, cay = compute_pointer(ptr_counter, p)
-    p = replace(p, _blend_phase=blend_phase)
+    breath_env = _breath_envelope(ptr_counter, p)
+    p = replace(p, _blend_phase=blend_phase, _breath_env=breath_env)
 
     if p.mode == "cells":
         return _render_cells(cax, cay, p)
@@ -384,6 +401,16 @@ def _render_pixel_phase_dots(cax: int, cay: int, p: Params) -> np.ndarray:
     else:
         legacy = {0: (3, 3, 3), 1: (0, 3, 3), 2: (3, 0, 3), 3: (3, 3, 0)}
         rg, gg, bg = legacy.get(p.palette, (3, 3, 3))
+
+    # Breath modulates the wave amplitude *before* channel gain so it dims the
+    # whole pattern instead of individual channels. env maps linearly to a
+    # scale in [breath_min..1.0] via (env + breath_min*N) / ((1+breath_min)*N),
+    # with rounding so the dim state never collapses to 0 at peak amplitude.
+    if p.breath:
+        # breath_env 0..15 → scale factor 0.5..1.0 (bias 15 under, 15 over).
+        scale_num = p._breath_env + 15
+        scale_den = 30
+        vga_level = ((vga_level * scale_num + scale_den // 2) // scale_den).astype(np.int32)
 
     # Channel output = (vga_level * channel_gain) / 3 → still 0..3, then *85 → 0..255.
     r_out = (vga_level * rg) // 3
