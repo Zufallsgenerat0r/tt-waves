@@ -40,6 +40,24 @@ class Params:
     # the 16-entry hue ring source B sits from source A (8 = complementary).
     dual_color: bool = False
     palette_b_offset: int = 8
+
+    # Morph — slow triangle that blends pixeldots (static lattice, amplitude
+    # brightness) ↔ dotsfull (displaced dots, binary brightness). Same state
+    # used both ways: scale displacement by env and blend brightness toward
+    # full as env → max.
+    morph: bool = False
+    morph_shift: int = 5        # ptr_counter bits driving the 5-bit triangle
+    morph_floor: int = 0        # 0..15 min env so we don't fully collapse
+    _morph_env: int = 0         # internal: this frame's 0..15 envelope
+
+    # Pattern swap — slowly mux source-B's formula so the interference shape
+    # changes. 4 modes: 0 = point-mirror (current), 1 = y-mirror only,
+    # 2 = x-mirror only, 3 = B locked at screen centre. pattern_shift picks
+    # ptr_counter bits for the 2-bit mode index (auto-cycle when pattern_auto).
+    pattern_mode: int = 0
+    pattern_auto: bool = False
+    pattern_shift: int = 7      # 2^shift frames per mode (128 in preview)
+    _pattern_mode: int = 0      # internal: resolved mode for this frame
     slow: bool = False        # ui_in[3]: halves Lissajous rate
     clip_to_cell: bool = True # Verilog clips dots at 16-px cell boundary
 
@@ -97,8 +115,7 @@ def compute_pointer(ptr_counter: int, p: Params) -> tuple[int, int]:
 def compute_phase(cax: int, cay: int, p: Params) -> tuple[np.ndarray, np.ndarray]:
     """Per-cell ra_lat, rb_lat grids (shape 30, 40). These are the raw
     modular-r² values; downstream passes map them to dots, color, or brightness."""
-    cbx = W - cax
-    cby = H - cay
+    cbx, cby = _source_b_center(cax, cay, p._pattern_mode)
     accum_mask = (1 << p.accum_bits) - 1
     ra_mask = (1 << (p.accum_bits + 1)) - 1
     lat_mask = (1 << (p.accum_bits + 1 - p.shift_right)) - 1
@@ -247,6 +264,35 @@ def _breath_envelope(ptr_counter: int, p: Params) -> int:
     return max(env, p.breath_floor)
 
 
+def _morph_envelope(ptr_counter: int, p: Params) -> int:
+    """Slow 0..15 triangle that blends pixeldots ↔ dotsfull. Same triangle-fold
+    trick as breath, just a different counter slice."""
+    if not p.morph:
+        return 0
+    raw = (ptr_counter >> p.morph_shift) & 0x1F
+    env = raw if (raw & 0x10) == 0 else (31 - raw)
+    return max(env, p.morph_floor)
+
+
+def _pattern_mode(ptr_counter: int, p: Params) -> int:
+    """Resolve pattern_mode — manual or slow auto-cycle (2-bit index)."""
+    if not p.pattern_auto:
+        return p.pattern_mode & 0x3
+    return (ptr_counter >> p.pattern_shift) & 0x3
+
+
+def _source_b_center(cax: int, cay: int, mode: int) -> tuple[int, int]:
+    """Pick source B's centre based on pattern mode."""
+    if mode == 0:   # point mirror
+        return W - cax, H - cay
+    if mode == 1:   # y-mirror only (sources share x)
+        return cax, H - cay
+    if mode == 2:   # x-mirror only (sources share y)
+        return W - cax, cay
+    # mode 3: B anchored at screen centre
+    return W // 2, H // 2
+
+
 def render_frame(ptr_counter: int, p: Params | None = None) -> np.ndarray:
     if p is None:
         p = Params()
@@ -258,7 +304,10 @@ def render_frame(ptr_counter: int, p: Params | None = None) -> np.ndarray:
     p = replace(p, palette=pal_idx, palette_auto=auto)
     cax, cay = compute_pointer(ptr_counter, p)
     breath_env = _breath_envelope(ptr_counter, p)
-    p = replace(p, _blend_phase=blend_phase, _breath_env=breath_env)
+    morph_env = _morph_envelope(ptr_counter, p)
+    pattern_mode = _pattern_mode(ptr_counter, p)
+    p = replace(p, _blend_phase=blend_phase, _breath_env=breath_env,
+                _morph_env=morph_env, _pattern_mode=pattern_mode)
 
     if p.mode == "cells":
         return _render_cells(cax, cay, p)
@@ -270,6 +319,8 @@ def render_frame(ptr_counter: int, p: Params | None = None) -> np.ndarray:
         return _render_pixel_phase_dots(cax, cay, p)
     if p.mode == "dotsfull":
         return _render_dots_full(cax, cay, p)
+    if p.mode == "morph":
+        return _render_morph(cax, cay, p)
 
     dlx, dly = compute_displacements(cax, cay, p)
     return _render_dots(dlx, dly, p)
@@ -317,12 +368,106 @@ def _render_cells(cax: int, cay: int, p: Params) -> np.ndarray:
     return frame[:H, :W]
 
 
+def _render_morph(cax: int, cay: int, p: Params) -> np.ndarray:
+    """Morphing mode: blends pixeldots (static lattice, amplitude brightness)
+    and dotsfull (displaced dots, binary brightness) by the morph envelope
+    0..15. At env=0 → pure pixeldots; at env=15 → pure dotsfull; in between
+    the dots partially displace and the brightness lifts toward binary.
+
+    Silicon cost vs pixeldots: one extra 4-bit multiply per axis for
+    displacement scaling, one linear blend on amplitude. ~40 gates."""
+    ra, rb = _pixel_phase(cax, cay, p)
+    ba = _phase_to_brightness(ra, p)
+    bb = _phase_to_brightness(rb, p)
+    mask = (1 << p.bright_bits) - 1
+
+    # Per-cell displacement (from F algorithm), scaled by morph_env/15.
+    if p.dual_color:
+        dlx_a_only, dly_a_only, dlx_b_only, dly_b_only = _split_displacements(cax, cay, p)
+        dlx_a = (dlx_a_only * p._morph_env) // 15
+        dly_a = (dly_a_only * p._morph_env) // 15
+        dlx_b = (dlx_b_only * p._morph_env) // 15
+        dly_b = (dly_b_only * p._morph_env) // 15
+    else:
+        dlx, dly = compute_displacements(cax, cay, p)
+        dlx = (dlx * p._morph_env) // 15
+        dly = (dly * p._morph_env) // 15
+
+    dr = p.dot_r
+
+    def build_mask(dx: np.ndarray, dy: np.ndarray) -> np.ndarray:
+        n_rows, n_cols = dx.shape
+        m = np.zeros((H, W), dtype=bool)
+        for cy in range(n_rows):
+            for cx in range(n_cols):
+                dot_cx = cx * LATTICE + 8 + int(dx[cy, cx])
+                dot_cy = cy * LATTICE + 8 + int(dy[cy, cx])
+                x0 = dot_cx - dr; x1 = dot_cx + dr + 1
+                y0 = dot_cy - dr; y1 = dot_cy + dr + 1
+                if p.clip_to_cell:
+                    x0 = max(x0, cx * LATTICE); x1 = min(x1, (cx + 1) * LATTICE)
+                    y0 = max(y0, cy * LATTICE); y1 = min(y1, (cy + 1) * LATTICE)
+                x0 = max(x0, 0); x1 = min(x1, W)
+                y0 = max(y0, 0); y1 = min(y1, H)
+                if x1 > x0 and y1 > y0:
+                    m[y0:y1, x0:x1] = True
+        return m
+
+    # Per-source amplitude map (pixeldots-style), blended toward binary (dotsfull-style)
+    # by the morph envelope. amp' = amp + (mask - amp) * env / 15.
+    # ba/bb are already per-pixel (H, W) from _pixel_phase.
+    def blend_amp(amp_pixel: np.ndarray, src_mask: np.ndarray) -> np.ndarray:
+        lifted = amp_pixel + ((mask - amp_pixel) * p._morph_env + 7) // 15
+        return np.where(src_mask, lifted, 0).astype(np.int32)
+
+    if p.dual_color:
+        mask_a = build_mask(dlx_a, dly_a)
+        mask_b = build_mask(dlx_b, dly_b)
+        # For dual_color we pass 0..mask amplitudes per source.
+        amp_a = blend_amp(ba, mask_a)
+        amp_b = blend_amp(bb, mask_b)
+        # Combined mask for breath reference.
+        return _dual_color_out(amp_a, amp_b, mask_a | mask_b, mask, p)
+
+    # Single-colour path.
+    dot_mask = build_mask(dlx, dly)
+    level = (ba + bb) & mask
+    amp = blend_amp(level, dot_mask)
+    amp = (amp * 3 + mask // 2) // mask if mask > 0 else np.where(dot_mask, 3, 0)
+    amp = np.where(dot_mask, amp, 0).astype(np.int32)
+
+    # Now apply the same palette+dither+breath chain as pixeldots.
+    if p.palette_auto:
+        rg_a, gg_a, bg_a = _palette_gain_2b(p.palette)
+        rg_b, gg_b, bg_b = _palette_gain_2b(p.palette + 1)
+        if p.palette_dither:
+            tile_y = np.arange(H)[:, None] & 3
+            tile_x = np.arange(W)[None, :] & 3
+            threshold = _BAYER4[tile_y, tile_x]
+            pick_b = (threshold < p._blend_phase)
+            rg = np.where(pick_b, rg_b, rg_a).astype(np.int32)
+            gg = np.where(pick_b, gg_b, gg_a).astype(np.int32)
+            bg = np.where(pick_b, bg_b, bg_a).astype(np.int32)
+        else:
+            rg, gg, bg = rg_a, gg_a, bg_a
+    else:
+        legacy = {0: (3, 3, 3), 1: (0, 3, 3), 2: (3, 0, 3), 3: (3, 3, 0)}
+        rg, gg, bg = legacy.get(p.palette, (3, 3, 3))
+
+    amp = _apply_breath(amp, p)
+    r_out = (amp * rg) // 3
+    g_out = (amp * gg) // 3
+    b_out = (amp * bg) // 3
+    return np.stack([(r_out * 85).astype(np.uint8),
+                     (g_out * 85).astype(np.uint8),
+                     (b_out * 85).astype(np.uint8)], axis=-1)
+
+
 def _split_displacements(cax: int, cay: int, p: Params) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """A-only and B-only per-cell (dlx, dly) — no summation, each clipped
     to ±sat independently. Used by dual_color dotsfull to paint each source's
     dots separately."""
-    cbx = W - cax
-    cby = H - cay
+    cbx, cby = _source_b_center(cax, cay, p._pattern_mode)
     accum_mask = (1 << p.accum_bits) - 1
     ra_mask = (1 << (p.accum_bits + 1)) - 1
     lat_mask = (1 << (p.accum_bits + 1 - p.shift_right)) - 1
@@ -450,8 +595,7 @@ def _render_dots_full(cax: int, cay: int, p: Params) -> np.ndarray:
 def _pixel_phase(cax: int, cay: int, p: Params) -> tuple[np.ndarray, np.ndarray]:
     """Full-resolution per-pixel ra, rb phase arrays (shape H, W).
     In silicon this equals the per-pixel accumulator state — no latch."""
-    cbx = W - cax
-    cby = H - cay
+    cbx, cby = _source_b_center(cax, cay, p._pattern_mode)
     accum_mask = (1 << p.accum_bits) - 1
     ra_mask = (1 << (p.accum_bits + 1)) - 1
     ys = np.arange(H)[:, None]

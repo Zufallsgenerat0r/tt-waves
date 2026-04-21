@@ -41,6 +41,17 @@ PRESETS: dict[str, dict] = {
                              palette_auto=True, palette_shift=6,
                              breath=True, breath_shift=3, breath_floor=4,
                              dual_color=True, palette_b_offset=8),
+    "morph-dual":      dict(mode="morph", bright_lsb=9, bright_bits=3,
+                             palette_auto=True, palette_shift=6,
+                             breath=True, breath_shift=3, breath_floor=4,
+                             dual_color=True, palette_b_offset=8,
+                             morph=True, morph_shift=4),
+    "morph-full":      dict(mode="morph", bright_lsb=9, bright_bits=3,
+                             palette_auto=True, palette_shift=6,
+                             breath=True, breath_shift=3, breath_floor=4,
+                             dual_color=True, palette_b_offset=8,
+                             morph=True, morph_shift=4,
+                             pattern_auto=True, pattern_shift=7),
     "cells11":    dict(mode="cells", bright_lsb=9, bright_bits=3),
 }
 
