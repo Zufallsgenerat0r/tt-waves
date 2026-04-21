@@ -33,6 +33,14 @@ PRESETS: dict[str, dict] = {
     "dotsfull":        dict(mode="dotsfull",
                              palette_auto=True, palette_shift=6,
                              breath=True, breath_shift=3, breath_floor=4),
+    "pixeldots-dual":  dict(mode="pixeldots", bright_lsb=9, bright_bits=3, bright_floor=0,
+                             palette_auto=True, palette_shift=6,
+                             breath=True, breath_shift=3, breath_floor=4,
+                             dual_color=True, palette_b_offset=8),
+    "dotsfull-dual":   dict(mode="dotsfull",
+                             palette_auto=True, palette_shift=6,
+                             breath=True, breath_shift=3, breath_floor=4,
+                             dual_color=True, palette_b_offset=8),
     "cells11":    dict(mode="cells", bright_lsb=9, bright_bits=3),
 }
 

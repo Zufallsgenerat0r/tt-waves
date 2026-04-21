@@ -34,6 +34,12 @@ class Params:
     breath_shift: int = 5       # ptr_counter bits driving the 4-bit phase
     breath_floor: int = 4       # 0..15 min envelope so trough doesn't go fully black
     _breath_env: int = 15       # internal: this frame's envelope 0..15
+
+    # Dual-colour sources — each source drives its own palette entry, channels
+    # sum (saturating) where they overlap. palette_b_offset picks how far around
+    # the 16-entry hue ring source B sits from source A (8 = complementary).
+    dual_color: bool = False
+    palette_b_offset: int = 8
     slow: bool = False        # ui_in[3]: halves Lissajous rate
     clip_to_cell: bool = True # Verilog clips dots at 16-px cell boundary
 
@@ -311,31 +317,98 @@ def _render_cells(cax: int, cay: int, p: Params) -> np.ndarray:
     return frame[:H, :W]
 
 
+def _split_displacements(cax: int, cay: int, p: Params) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """A-only and B-only per-cell (dlx, dly) — no summation, each clipped
+    to ±sat independently. Used by dual_color dotsfull to paint each source's
+    dots separately."""
+    cbx = W - cax
+    cby = H - cay
+    accum_mask = (1 << p.accum_bits) - 1
+    ra_mask = (1 << (p.accum_bits + 1)) - 1
+    lat_mask = (1 << (p.accum_bits + 1 - p.shift_right)) - 1
+    n_cols = W // LATTICE
+    n_rows = H // LATTICE
+    cell_xs = np.arange(n_cols) * LATTICE + (LATTICE - 1)
+    cell_ys = np.arange(n_rows) * LATTICE + (LATTICE - 1)
+    dy_a = cell_ys - cay; dy_b = cell_ys - cby
+    dx_a = cell_xs - cax; dx_b = cell_xs - cbx
+    r1a = (dy_a * dy_a) & accum_mask
+    r1b = (dy_b * dy_b) & accum_mask
+    r2a = (dx_a * dx_a) & accum_mask
+    r2b = (dx_b * dx_b) & accum_mask
+    ra = (p.r1_weight * r1a[:, None] + r2a[None, :]) & ra_mask
+    rb = (p.r1_weight * r1b[:, None] + r2b[None, :]) & ra_mask
+    ra_lat = (ra >> p.shift_right) & lat_mask
+    rb_lat = (rb >> p.shift_right) & lat_mask
+    mag_mask = (1 << p.disp_mag_bits) - 1
+
+    def decode(lat, sgn_x, sgn_y, far_x, far_y):
+        s = (lat >> p.disp_sign_bit) & 1
+        m = (lat >> p.disp_mag_lsb) & mag_mask
+        d = np.where(s == 1, -m, m).astype(np.int32)
+        dlx = np.where(far_x == 1, np.where(sgn_x == 1, -d, d), 0)
+        dly = np.where(far_y == 1, np.where(sgn_y == 1, -d, d), 0)
+        return np.clip(dlx, -p.sat, p.sat).astype(np.int32), np.clip(dly, -p.sat, p.sat).astype(np.int32)
+
+    sgn_ax = (dx_a < 0).astype(np.int32); sgn_bx = (dx_b < 0).astype(np.int32)
+    sgn_ay = (dy_a < 0).astype(np.int32); sgn_by = (dy_b < 0).astype(np.int32)
+    far_ax = (np.abs(dx_a) > p.far_threshold).astype(np.int32)
+    far_bx = (np.abs(dx_b) > p.far_threshold).astype(np.int32)
+    far_ay = (np.abs(dy_a) > p.far_threshold).astype(np.int32)
+    far_by = (np.abs(dy_b) > p.far_threshold).astype(np.int32)
+    dlx_a, dly_a = decode(ra_lat, sgn_ax[None, :], sgn_ay[:, None], far_ax[None, :], far_ay[:, None])
+    dlx_b, dly_b = decode(rb_lat, sgn_bx[None, :], sgn_by[:, None], far_bx[None, :], far_by[:, None])
+    return dlx_a, dly_a, dlx_b, dly_b
+
+
 def _render_dots_full(cax: int, cay: int, p: Params) -> np.ndarray:
     """Displaced-dot lattice (Variant F's algorithm: per-cell axis-damped
     displacement from ra_lat / rb_lat bit patterns) coloured by the same
     palette-cycle + Bayer-dither + breath pipeline as pixeldots. Dots are
     drawn at full amplitude (binary mask); the colour pipeline handles all
-    intensity variation."""
-    dlx, dly = compute_displacements(cax, cay, p)
+    intensity variation.
 
-    # 5x5 per-cell dot mask at (8+dlx, 8+dly) within each 16-px cell.
-    n_rows, n_cols = dlx.shape
-    dot_mask = np.zeros((H, W), dtype=bool)
+    In dual_color mode, the A-source dots use one palette tint and the
+    B-source dots use another, with channels summing on overlap. Requires
+    separately masked A-dots and B-dots — which means drawing each source's
+    contribution independently."""
+    dlx, dly = compute_displacements(cax, cay, p)
+    # Per-source displacements too (A-only / B-only), so dual_color can paint
+    # each source's dots separately.
+    dlx_a_only, dly_a_only, dlx_b_only, dly_b_only = _split_displacements(cax, cay, p)
+
     dr = p.dot_r
-    for cy in range(n_rows):
-        for cx in range(n_cols):
-            dot_cx = cx * LATTICE + 8 + int(dlx[cy, cx])
-            dot_cy = cy * LATTICE + 8 + int(dly[cy, cx])
-            x0 = dot_cx - dr; x1 = dot_cx + dr + 1
-            y0 = dot_cy - dr; y1 = dot_cy + dr + 1
-            if p.clip_to_cell:
-                x0 = max(x0, cx * LATTICE); x1 = min(x1, (cx + 1) * LATTICE)
-                y0 = max(y0, cy * LATTICE); y1 = min(y1, (cy + 1) * LATTICE)
-            x0 = max(x0, 0); x1 = min(x1, W)
-            y0 = max(y0, 0); y1 = min(y1, H)
-            if x1 > x0 and y1 > y0:
-                dot_mask[y0:y1, x0:x1] = True
+
+    def build_mask(dx: np.ndarray, dy: np.ndarray) -> np.ndarray:
+        n_rows, n_cols = dx.shape
+        m = np.zeros((H, W), dtype=bool)
+        for cy in range(n_rows):
+            for cx in range(n_cols):
+                dot_cx = cx * LATTICE + 8 + int(dx[cy, cx])
+                dot_cy = cy * LATTICE + 8 + int(dy[cy, cx])
+                x0 = dot_cx - dr; x1 = dot_cx + dr + 1
+                y0 = dot_cy - dr; y1 = dot_cy + dr + 1
+                if p.clip_to_cell:
+                    x0 = max(x0, cx * LATTICE); x1 = min(x1, (cx + 1) * LATTICE)
+                    y0 = max(y0, cy * LATTICE); y1 = min(y1, (cy + 1) * LATTICE)
+                x0 = max(x0, 0); x1 = min(x1, W)
+                y0 = max(y0, 0); y1 = min(y1, H)
+                if x1 > x0 and y1 > y0:
+                    m[y0:y1, x0:x1] = True
+        return m
+
+    dot_mask = build_mask(dlx, dly)
+
+    if p.dual_color:
+        mask_a = build_mask(dlx_a_only, dly_a_only)
+        mask_b = build_mask(dlx_b_only, dly_b_only)
+        # Synthetic "amp" per source: full (3) inside that source's dot, else 0.
+        ba = np.where(mask_a, 3, 0).astype(np.int32)
+        bb = np.where(mask_b, 3, 0).astype(np.int32)
+        # Use the dual colour path — treat the binary A/B masks as amplitudes,
+        # mask=3 so amp_a/amp_b already 0..3 after the mask>>scaling no-op.
+        return _dual_color_out(ba, bb, dot_mask | mask_a | mask_b,
+                               mask=3, p=p)
 
     # Full-amplitude (vga_level=3) where lit, else 0 — dots are binary, colour
     # pipeline below scales each channel.
@@ -421,15 +494,83 @@ def _render_pixel_phase(cax: int, cay: int, p: Params) -> np.ndarray:
     return frame
 
 
+def _palette_pair(p: Params) -> tuple[tuple[int, int, int], tuple[int, int, int],
+                                       tuple[int, int, int], tuple[int, int, int]]:
+    """Return (gain_a, gain_a_next, gain_b, gain_b_next) 2-bit-per-channel tuples.
+    Both sources walk the same hue ring but offset by palette_b_offset, and each
+    blends into the next entry via the same Bayer dither phase."""
+    idx_a = p.palette
+    idx_b = p.palette + p.palette_b_offset
+    return (_palette_gain_2b(idx_a), _palette_gain_2b(idx_a + 1),
+            _palette_gain_2b(idx_b), _palette_gain_2b(idx_b + 1))
+
+
+def _dither_gain(cur: tuple[int, int, int], nxt: tuple[int, int, int],
+                 pick_next: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    rg = np.where(pick_next, nxt[0], cur[0]).astype(np.int32)
+    gg = np.where(pick_next, nxt[1], cur[1]).astype(np.int32)
+    bg = np.where(pick_next, nxt[2], cur[2]).astype(np.int32)
+    return rg, gg, bg
+
+
+def _apply_breath(level: np.ndarray, p: Params) -> np.ndarray:
+    if not p.breath:
+        return level
+    scale_num = p._breath_env + 15
+    scale_den = 30
+    return ((level * scale_num + scale_den // 2) // scale_den).astype(np.int32)
+
+
+def _dual_color_out(ba: np.ndarray, bb: np.ndarray, dot_mask: np.ndarray,
+                    mask: int, p: Params) -> np.ndarray:
+    """Each source tinted independently; channels sum (sat to 3) in overlap."""
+    # Per-source amplitude mapped to 0..3 VGA levels.
+    amp_a = (ba * 3) // mask if mask > 0 else ba
+    amp_b = (bb * 3) // mask if mask > 0 else bb
+    if p.bright_floor > 0:
+        amp_a = np.maximum(amp_a, p.bright_floor)
+        amp_b = np.maximum(amp_b, p.bright_floor)
+    amp_a = np.where(dot_mask, amp_a, 0).astype(np.int32)
+    amp_b = np.where(dot_mask, amp_b, 0).astype(np.int32)
+    amp_a = _apply_breath(amp_a, p)
+    amp_b = _apply_breath(amp_b, p)
+
+    # Pick palette A vs B (and dither into next entries for smooth transitions).
+    gain_a, gain_a_nxt, gain_b, gain_b_nxt = _palette_pair(p)
+    if p.palette_auto and p.palette_dither:
+        tile_y = np.arange(H)[:, None] & 3
+        tile_x = np.arange(W)[None, :] & 3
+        threshold = _BAYER4[tile_y, tile_x]
+        pick_next = (threshold < p._blend_phase)
+        rg_a, gg_a, bg_a = _dither_gain(gain_a, gain_a_nxt, pick_next)
+        rg_b, gg_b, bg_b = _dither_gain(gain_b, gain_b_nxt, pick_next)
+    else:
+        rg_a, gg_a, bg_a = gain_a
+        rg_b, gg_b, bg_b = gain_b
+
+    # Per-channel contribution per source, then saturating add.
+    def contrib(amp: np.ndarray, g: np.ndarray | int) -> np.ndarray:
+        return (amp * g) // 3
+    r = np.minimum(contrib(amp_a, rg_a) + contrib(amp_b, rg_b), 3)
+    g = np.minimum(contrib(amp_a, gg_a) + contrib(amp_b, gg_b), 3)
+    b = np.minimum(contrib(amp_a, bg_a) + contrib(amp_b, bg_b), 3)
+    frame = np.stack([(r * 85).astype(np.uint8),
+                      (g * 85).astype(np.uint8),
+                      (b * 85).astype(np.uint8)], axis=-1)
+    return frame
+
+
 def _render_pixel_phase_dots(cax: int, cay: int, p: Params) -> np.ndarray:
     """Per-pixel phase *modulates the brightness* of a dot-lattice mask.
     Dots are always in the lattice but dim in wave troughs and bright in peaks
-    — the 4 VGA levels per channel give a soft pulse instead of a hard on/off."""
+    — the 4 VGA levels per channel give a soft pulse instead of a hard on/off.
+
+    In dual_color mode each source drives its own palette entry; per-channel
+    contributions sum (saturating to 3) so overlap regions show mixed colour."""
     ra, rb = _pixel_phase(cax, cay, p)
     ba = _phase_to_brightness(ra, p)
     bb = _phase_to_brightness(rb, p)
     mask = (1 << p.bright_bits) - 1
-    level = (ba + bb) & mask
 
     # 5x5 dot mask, identical in every cell.
     ys = np.arange(H)[:, None]
@@ -440,8 +581,11 @@ def _render_pixel_phase_dots(cax: int, cay: int, p: Params) -> np.ndarray:
     ey = local_y - 8
     dot_mask = (np.abs(ex) <= p.dot_r) & (np.abs(ey) <= p.dot_r)
 
-    # Brightness = level directly, quantised to the 4 VGA levels (0..3) so the
-    # preview matches what 6-bit TinyVGA will actually emit.
+    if p.dual_color:
+        return _dual_color_out(ba, bb, dot_mask, mask, p)
+
+    # Single-colour mode: sum amplitudes modularly, map to a single VGA level.
+    level = (ba + bb) & mask
     vga_level = (level * 3) // mask if mask > 0 else 3 * dot_mask.astype(np.int32)
     if p.bright_floor > 0:
         vga_level = np.maximum(vga_level, p.bright_floor)
