@@ -46,6 +46,7 @@ class Params:
     # For "cells" / "bright": which ra_lat bits map to brightness.
     bright_lsb: int = 8
     bright_bits: int = 2
+    bright_floor: int = 0  # pixeldots: min VGA level (1..3) so troughs still glow
 
 
 def _tri(v: int) -> int:
@@ -271,32 +272,37 @@ def _render_pixel_phase(cax: int, cay: int, p: Params) -> np.ndarray:
 
 
 def _render_pixel_phase_dots(cax: int, cay: int, p: Params) -> np.ndarray:
-    """Per-pixel phase *gates* a dot-lattice mask. Dots only appear where the
-    combined wave amplitude is above threshold — rings become visible gaps in
-    the lattice."""
+    """Per-pixel phase *modulates the brightness* of a dot-lattice mask.
+    Dots are always in the lattice but dim in wave troughs and bright in peaks
+    — the 4 VGA levels per channel give a soft pulse instead of a hard on/off."""
     ra, rb = _pixel_phase(cax, cay, p)
     ba = _phase_to_brightness(ra, p)
     bb = _phase_to_brightness(rb, p)
     mask = (1 << p.bright_bits) - 1
     level = (ba + bb) & mask
 
-    # Dot mask: same 5x5 cell pattern, but only lit where level >= threshold.
+    # 5x5 dot mask, identical in every cell.
     ys = np.arange(H)[:, None]
     xs = np.arange(W)[None, :]
     local_x = xs & (LATTICE - 1)
     local_y = ys & (LATTICE - 1)
     ex = local_x - 8
     ey = local_y - 8
-    dr = p.dot_r
-    dot_mask = (np.abs(ex) <= dr) & (np.abs(ey) <= dr)
-    lit = dot_mask & (level >= (mask // 2 + 1))
+    dot_mask = (np.abs(ex) <= p.dot_r) & (np.abs(ey) <= p.dot_r)
 
-    step = 255 // mask if mask > 0 else 255
-    val = (level * step * lit).astype(np.int32)
+    # Brightness = level directly, with a minimum floor so the lattice is always
+    # visible even in wave troughs. Quantised to the 4-level VGA palette so the
+    # preview matches what 6-bit TinyVGA will actually emit.
+    vga_level = (level * 3) // mask if mask > 0 else 3 * dot_mask.astype(np.int32)
+    if p.bright_floor > 0:
+        vga_level = np.maximum(vga_level, p.bright_floor)
+    vga_level = np.where(dot_mask, vga_level, 0)
+    vga_intensity = (vga_level * 85).astype(np.int32)  # 0, 85, 170, 255
+
     r, g, b = _palette_rgb(p.palette)
-    frame = np.stack([(val * r // 255).astype(np.uint8),
-                      (val * g // 255).astype(np.uint8),
-                      (val * b // 255).astype(np.uint8)], axis=-1)
+    frame = np.stack([(vga_intensity * r // 255).astype(np.uint8),
+                      (vga_intensity * g // 255).astype(np.uint8),
+                      (vga_intensity * b // 255).astype(np.uint8)], axis=-1)
     return frame
 
 

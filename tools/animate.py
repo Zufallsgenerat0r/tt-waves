@@ -23,7 +23,8 @@ PRESETS: dict[str, dict] = {
     "plasma10":   dict(mode="pixel", bright_lsb=10, bright_bits=3),
     "plasma9-c":  dict(mode="pixel", bright_lsb=9, bright_bits=3, palette=1),
     "plasma9-m":  dict(mode="pixel", bright_lsb=9, bright_bits=3, palette=2),
-    "pixeldots":  dict(mode="pixeldots", bright_lsb=9, bright_bits=3),
+    "pixeldots":       dict(mode="pixeldots", bright_lsb=9, bright_bits=3, bright_floor=1),
+    "pixeldots-nofloor": dict(mode="pixeldots", bright_lsb=9, bright_bits=3, bright_floor=0),
     "cells11":    dict(mode="cells", bright_lsb=9, bright_bits=3),
 }
 
