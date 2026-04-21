@@ -30,6 +30,9 @@ PRESETS: dict[str, dict] = {
     "pixeldots-breath": dict(mode="pixeldots", bright_lsb=9, bright_bits=3, bright_floor=0,
                               palette_auto=True, palette_shift=6,
                               breath=True, breath_shift=3, breath_floor=4),
+    "dotsfull":        dict(mode="dotsfull",
+                             palette_auto=True, palette_shift=6,
+                             breath=True, breath_shift=3, breath_floor=4),
     "cells11":    dict(mode="cells", bright_lsb=9, bright_bits=3),
 }
 

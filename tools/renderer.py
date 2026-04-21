@@ -262,6 +262,8 @@ def render_frame(ptr_counter: int, p: Params | None = None) -> np.ndarray:
         return _render_pixel_phase(cax, cay, p)
     if p.mode == "pixeldots":
         return _render_pixel_phase_dots(cax, cay, p)
+    if p.mode == "dotsfull":
+        return _render_dots_full(cax, cay, p)
 
     dlx, dly = compute_displacements(cax, cay, p)
     return _render_dots(dlx, dly, p)
@@ -307,6 +309,69 @@ def _render_cells(cax: int, cay: int, p: Params) -> np.ndarray:
     # Expand per-cell to per-pixel.
     frame = np.repeat(np.repeat(rgb, LATTICE, axis=0), LATTICE, axis=1)
     return frame[:H, :W]
+
+
+def _render_dots_full(cax: int, cay: int, p: Params) -> np.ndarray:
+    """Displaced-dot lattice (Variant F's algorithm: per-cell axis-damped
+    displacement from ra_lat / rb_lat bit patterns) coloured by the same
+    palette-cycle + Bayer-dither + breath pipeline as pixeldots. Dots are
+    drawn at full amplitude (binary mask); the colour pipeline handles all
+    intensity variation."""
+    dlx, dly = compute_displacements(cax, cay, p)
+
+    # 5x5 per-cell dot mask at (8+dlx, 8+dly) within each 16-px cell.
+    n_rows, n_cols = dlx.shape
+    dot_mask = np.zeros((H, W), dtype=bool)
+    dr = p.dot_r
+    for cy in range(n_rows):
+        for cx in range(n_cols):
+            dot_cx = cx * LATTICE + 8 + int(dlx[cy, cx])
+            dot_cy = cy * LATTICE + 8 + int(dly[cy, cx])
+            x0 = dot_cx - dr; x1 = dot_cx + dr + 1
+            y0 = dot_cy - dr; y1 = dot_cy + dr + 1
+            if p.clip_to_cell:
+                x0 = max(x0, cx * LATTICE); x1 = min(x1, (cx + 1) * LATTICE)
+                y0 = max(y0, cy * LATTICE); y1 = min(y1, (cy + 1) * LATTICE)
+            x0 = max(x0, 0); x1 = min(x1, W)
+            y0 = max(y0, 0); y1 = min(y1, H)
+            if x1 > x0 and y1 > y0:
+                dot_mask[y0:y1, x0:x1] = True
+
+    # Full-amplitude (vga_level=3) where lit, else 0 — dots are binary, colour
+    # pipeline below scales each channel.
+    vga_level = np.where(dot_mask, 3, 0).astype(np.int32)
+
+    # Palette cycle + Bayer dither (identical to pixeldots' pipeline).
+    if p.palette_auto:
+        rg_a, gg_a, bg_a = _palette_gain_2b(p.palette)
+        rg_b, gg_b, bg_b = _palette_gain_2b(p.palette + 1)
+        if p.palette_dither:
+            tile_y = np.arange(H)[:, None] & 3
+            tile_x = np.arange(W)[None, :] & 3
+            threshold = _BAYER4[tile_y, tile_x]
+            pick_b = (threshold < p._blend_phase)
+            rg = np.where(pick_b, rg_b, rg_a).astype(np.int32)
+            gg = np.where(pick_b, gg_b, gg_a).astype(np.int32)
+            bg = np.where(pick_b, bg_b, bg_a).astype(np.int32)
+        else:
+            rg, gg, bg = rg_a, gg_a, bg_a
+    else:
+        legacy = {0: (3, 3, 3), 1: (0, 3, 3), 2: (3, 0, 3), 3: (3, 3, 0)}
+        rg, gg, bg = legacy.get(p.palette, (3, 3, 3))
+
+    # Breath envelope scales vga_level 50..100%.
+    if p.breath:
+        scale_num = p._breath_env + 15
+        scale_den = 30
+        vga_level = ((vga_level * scale_num + scale_den // 2) // scale_den).astype(np.int32)
+
+    r_out = (vga_level * rg) // 3
+    g_out = (vga_level * gg) // 3
+    b_out = (vga_level * bg) // 3
+    frame = np.stack([(r_out * 85).astype(np.uint8),
+                      (g_out * 85).astype(np.uint8),
+                      (b_out * 85).astype(np.uint8)], axis=-1)
+    return frame
 
 
 def _pixel_phase(cax: int, cay: int, p: Params) -> tuple[np.ndarray, np.ndarray]:
