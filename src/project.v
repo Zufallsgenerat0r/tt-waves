@@ -149,15 +149,11 @@ module tt_um_kilian_waves (
   wire p_cur_x_far = ~((&p_cur_x[9:4]) | (~|p_cur_x[9:4]));
   wire p_cur_y_far = ~((&p_cur_y[9:4]) | (~|p_cur_y[9:4]));
 
-  // --- Hblank fix-up operands (per-source, derived combinationally).
-  wire signed [9:0] offset_ax = center_ax - 10'sd320;
-  wire signed [9:0] offset_bx = center_bx - 10'sd320;
-  wire [9:0] abs_off_ax = offset_ax[9] ? (10'd0 - offset_ax) : offset_ax;
-  wire [9:0] abs_off_bx = offset_bx[9] ? (10'd0 - offset_bx) : offset_bx;
-
-  // Time-muxed hblank walk operands.
-  wire signed [9:0] offset_cur   = phase ? offset_bx   : offset_ax;
-  wire        [9:0] abs_off_cur  = phase ? abs_off_bx  : abs_off_ax;
+  // --- Hblank fix-up operands. Compute once through the already-muxed
+  // center_cur_x — saves a subtractor and an abs-er versus the per-source
+  // (offset_ax, offset_bx) + muxing approach.
+  wire signed [9:0] offset_cur  = center_cur_x - 10'sd320;
+  wire        [9:0] abs_off_cur = offset_cur[9] ? (10'd0 - offset_cur) : offset_cur;
 
   // --- r1 update delta (single adder shared for x==0 case).
   // 2·p_cur_y - 1 on either phase (A on phase=0, B on phase=1).
