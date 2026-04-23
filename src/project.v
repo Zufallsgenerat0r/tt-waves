@@ -263,12 +263,44 @@ module tt_um_kilian_waves (
   wire signed [4:0] dlx_sum = dlx_a + dlx_b;
   wire signed [4:0] dly_sum = dly_a + dly_b;
 
-  wire signed [3:0] dlx = (dlx_sum >  5'sd6) ?  4'sd6
-                        : (dlx_sum < -5'sd6) ? -4'sd6
-                        : dlx_sum[3:0];
-  wire signed [3:0] dly = (dly_sum >  5'sd6) ?  4'sd6
-                        : (dly_sum < -5'sd6) ? -4'sd6
-                        : dly_sum[3:0];
+  wire signed [3:0] dlx_sat = (dlx_sum >  5'sd6) ?  4'sd6
+                            : (dlx_sum < -5'sd6) ? -4'sd6
+                            : dlx_sum[3:0];
+  wire signed [3:0] dly_sat = (dly_sum >  5'sd6) ?  4'sd6
+                            : (dly_sum < -5'sd6) ? -4'sd6
+                            : dly_sum[3:0];
+
+  // --- Morph envelope: slow triangle 0..15..0 from ptr_counter[8:4] (5-bit
+  // slice, 512-frame cycle at 60 Hz ≈ 8.5 s). Frame-stable — ptr_counter only
+  // advances on vsync rising edge — so no dedicated flop needed.
+  localparam MORPH_SHIFT = 4;
+  wire [4:0] morph_raw = ptr_counter[MORPH_SHIFT+4 : MORPH_SHIFT];
+  wire [3:0] morph_env = morph_raw[4] ? (5'd31 - morph_raw) : morph_raw[3:0];
+
+  // Scale saturated displacement by morph_env ≈ /15 via >>> 4. At env=0 dots
+  // sit at cell centres; at env=15 positive peaks attenuate one level (+6 →
+  // +5 via floor(90/16)) while negative peaks hold (−6 → −6 via floor(−90/16))
+  // — an imperceptible asymmetry for a morph endpoint. One multiplier time-
+  // shared across x and y via phase: phase=0 → dlx, phase=1 → dly; results
+  // latched so both axes are available combinationally downstream.
+  wire signed [3:0] dl_in = phase ? dly_sat : dlx_sat;
+  wire signed [8:0] dl_scaled = $signed({1'b0, morph_env}) * dl_in;
+  wire signed [3:0] dl_morphed = dl_scaled >>> 4;
+
+  reg signed [3:0] dlx_m, dly_m;
+  always @(posedge clk) begin
+    if (~rst_n) begin
+      dlx_m <= 0;
+      dly_m <= 0;
+    end else if (phase == 1'b0) begin
+      dlx_m <= dl_morphed;
+    end else begin
+      dly_m <= dl_morphed;
+    end
+  end
+
+  wire signed [3:0] dlx = dlx_m;
+  wire signed [3:0] dly = dly_m;
 
   // --- Block C: dot mask, pipelined.
   wire signed [5:0] ex = $signed({2'b00, x[3:0]}) - 6'sd8 - {{2{dlx[3]}}, dlx};

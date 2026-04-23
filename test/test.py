@@ -324,15 +324,28 @@ async def test_deep_background_black(dut):
 @cocotb.test()
 async def test_dots_displace_between_frames(dut):
     """Over a 16-frame span the displacement field should change
-    non-trivially (the Lissajous pointer advances)."""
+    non-trivially (the Lissajous pointer advances).
+
+    Force ptr_counter to a high morph_env value first — at env=0 the morph
+    envelope zeroes displacement, so early frames show an identical static
+    lattice and the pointer-motion check would vacuously hold."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps")
     cocotb.start_soon(clock.start())
     await reset_dut(dut)
 
-    await ClockCycles(dut.clk, FRAME_INT * 2 + 200)
+    await ClockCycles(dut.clk, 64)
+    try:
+        # pc=240 → morph_raw=15 → env=15 (full displacement).
+        dut.user_project.ptr_counter.value = 240
+    except AttributeError:
+        dut._log.info("ptr_counter not accessible (GL sim?); skipping")
+        return
+    await ClockCycles(dut.clk, FRAME_INT + 200)
     pixels_a = await capture_frame(dut)
 
-    await ClockCycles(dut.clk, FRAME_INT * 16)
+    # pc=256 → morph_raw=16 → env=31-16=15 still. Pointer has advanced.
+    dut.user_project.ptr_counter.value = 256
+    await ClockCycles(dut.clk, FRAME_INT)
     pixels_b = await capture_frame(dut)
 
     differences = 0
@@ -346,6 +359,60 @@ async def test_dots_displace_between_frames(dut):
     pct = differences * 100 / max(samples, 1)
     dut._log.info(f"Frame-diff: {differences}/{samples} ({pct:.2f}%)")
     assert differences > 0, "Frames should differ — the Lissajous pointer should be moving"
+
+
+@cocotb.test()
+async def test_morph_env_zero_static_lattice(dut):
+    """At morph_env=0 (ptr_counter slice 0 or 31 in bits [8:4]) dots sit on
+    the static 16-px lattice centres — no source displaces them."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    await ClockCycles(dut.clk, 64)
+    try:
+        dut.user_project.ptr_counter.value = 0  # morph_raw=0 → env=0
+    except AttributeError:
+        dut._log.info("ptr_counter not accessible (GL sim?); skipping")
+        return
+    await ClockCycles(dut.clk, FRAME_INT + 200)
+    pixels = await capture_frame(dut)
+
+    # With zero displacement, every dot sits centred at (cx*16+8, cy*16+8) with
+    # Chebyshev radius 2 → 5x5 block at [cx*16+6 .. cx*16+10] × [cy*16+6 .. cy*16+10].
+    # Check that OUTSIDE this centred region every pixel is black.
+    stray = 0
+    for y in range(V_DISPLAY):
+        for x in range(H_DISPLAY):
+            lx, ly = x % LATTICE, y % LATTICE
+            in_centre = 6 <= lx <= 10 and 6 <= ly <= 10
+            if not in_centre and is_lit(pixels[y][x]):
+                stray += 1
+    assert stray == 0, f"{stray} pixels lit outside cell centres at env=0"
+
+
+@cocotb.test()
+async def test_morph_env_cycle(dut):
+    """morph_env must triangle-fold cleanly: at pc[8:4]=0 and pc[8:4]=31 → env=0;
+    at pc[8:4]=15 and pc[8:4]=16 → env=15."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    await ClockCycles(dut.clk, 64)
+    try:
+        _ = dut.user_project.morph_env.value
+    except AttributeError:
+        dut._log.info("morph_env not accessible (GL sim?); skipping")
+        return
+
+    # pc = raw << 4 so that morph_raw = raw. Sweep raw 0..31.
+    for raw in range(32):
+        dut.user_project.ptr_counter.value = raw << 4
+        await ClockCycles(dut.clk, 4)
+        env = int(dut.user_project.morph_env.value)
+        expected = raw if raw < 16 else 31 - raw
+        assert env == expected, f"raw={raw}: morph_env={env}, expected {expected}"
 
 
 @cocotb.test()
