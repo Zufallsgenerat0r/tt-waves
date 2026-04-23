@@ -330,17 +330,32 @@ module tt_um_kilian_waves (
     end
   end
 
-  // Modular sum — interference fringes appear where sources sum wraps around.
-  wire [2:0] level = amp_a + amp_b;
-
-  // Morph-blend toward binary: lifted = level + ((7 − level) × env) >> 4.
-  // env=0 → lifted = level (pure amplitude modulation); env=15 → lifted = 7
-  // for any level (binary full — matches F). Small 3×4 unsigned multiplier.
-  wire [2:0] amp_delta = 3'd7 - level;
+  // --- Per-source morph blend toward binary. Each source is lifted
+  // independently so dual-colour can paint A-dominant and B-dominant regions
+  // in their own palette tints. The same 3×4 multiplier handles both sides
+  // via phase: phase=0 → source A delta, phase=1 → source B delta.
+  wire [2:0] amp_in = phase ? amp_b : amp_a;
+  wire [2:0] amp_delta = 3'd7 - amp_in;
   wire [6:0] amp_lift_full = amp_delta * morph_env;
   wire [2:0] amp_lift = amp_lift_full[6:4];
-  wire [3:0] lifted_raw = {1'b0, level} + {1'b0, amp_lift};
-  wire [2:0] lifted = lifted_raw[3] ? 3'b111 : lifted_raw[2:0];
+  wire [3:0] amp_lifted_raw = {1'b0, amp_in} + {1'b0, amp_lift};
+  wire [2:0] amp_lifted_cur = amp_lifted_raw[3] ? 3'b111 : amp_lifted_raw[2:0];
+
+  reg [2:0] amp_a_lifted, amp_b_lifted;
+  always @(posedge clk) begin
+    if (~rst_n) begin
+      amp_a_lifted <= 0;
+      amp_b_lifted <= 0;
+    end else if (phase == 1'b0) begin
+      amp_a_lifted <= amp_lifted_cur;
+    end else begin
+      amp_b_lifted <= amp_lifted_cur;
+    end
+  end
+
+  // Map per-source lifted amplitude (0..7) → VGA range (0..3).
+  wire [1:0] amp_a_vga = amp_a_lifted[2:1];
+  wire [1:0] amp_b_vga = amp_b_lifted[2:1];
 
   // --- Block E: palette lookup.
   // pal_idx cycles 0..15 every 2^PALETTE_SHIFT frames; full hue ring = 1024
@@ -349,25 +364,39 @@ module tt_um_kilian_waves (
   // (the palette is a rotation around the blue corner of the VGA cube), so
   // hardwire pal_b = 3 and save a 2-bit mux per-entry and a scale stage.
   localparam PALETTE_SHIFT = 6;
-  wire [3:0] pal_idx = ptr_counter[PALETTE_SHIFT+3 : PALETTE_SHIFT];
+  wire [3:0] pal_idx   = ptr_counter[PALETTE_SHIFT+3 : PALETTE_SHIFT];
+  wire [3:0] pal_idx_b = pal_idx + 4'd8;  // +8 = complementary (180° hue)
 
-  reg [1:0] pal_r, pal_g;
-  always @(*) begin
-    case (pal_idx)
-      4'd2:         begin pal_r = 2'd2; pal_g = 2'd3; end
-      4'd3:         begin pal_r = 2'd1; pal_g = 2'd3; end
-      4'd4:         begin pal_r = 2'd0; pal_g = 2'd3; end
-      4'd5:         begin pal_r = 2'd0; pal_g = 2'd2; end
-      4'd6:         begin pal_r = 2'd0; pal_g = 2'd1; end
-      4'd7, 4'd8:   begin pal_r = 2'd0; pal_g = 2'd0; end
-      4'd9:         begin pal_r = 2'd1; pal_g = 2'd0; end
-      4'd10:        begin pal_r = 2'd2; pal_g = 2'd0; end
-      4'd11, 4'd12: begin pal_r = 2'd3; pal_g = 2'd0; end
-      4'd13:        begin pal_r = 2'd3; pal_g = 2'd1; end
-      4'd14:        begin pal_r = 2'd3; pal_g = 2'd2; end
-      default:      begin pal_r = 2'd3; pal_g = 2'd3; end  // idx 0, 1, 15 = white
-    endcase
-  end
+  function [3:0] pal_lookup;  // returns {pal_r, pal_g} for a given index
+    input [3:0] idx;
+    begin
+      case (idx)
+        4'd2:         pal_lookup = {2'd2, 2'd3};
+        4'd3:         pal_lookup = {2'd1, 2'd3};
+        4'd4:         pal_lookup = {2'd0, 2'd3};
+        4'd5:         pal_lookup = {2'd0, 2'd2};
+        4'd6:         pal_lookup = {2'd0, 2'd1};
+        4'd7, 4'd8:   pal_lookup = {2'd0, 2'd0};
+        4'd9:         pal_lookup = {2'd1, 2'd0};
+        4'd10:        pal_lookup = {2'd2, 2'd0};
+        4'd11, 4'd12: pal_lookup = {2'd3, 2'd0};
+        4'd13:        pal_lookup = {2'd3, 2'd1};
+        4'd14:        pal_lookup = {2'd3, 2'd2};
+        default:      pal_lookup = {2'd3, 2'd3};  // idx 0, 1, 15 = white
+      endcase
+    end
+  endfunction
+
+  wire [3:0] pal_a_raw = pal_lookup(pal_idx);
+  wire [3:0] pal_b_raw = pal_lookup(pal_idx_b);
+  wire [1:0] pal_r_a = pal_a_raw[3:2];
+  wire [1:0] pal_g_a = pal_a_raw[1:0];
+  wire [1:0] pal_r_b = pal_b_raw[3:2];
+  wire [1:0] pal_g_b = pal_b_raw[1:0];
+
+  // Back-compat aliases for the palette test that reads these wire names.
+  wire [1:0] pal_r = pal_r_a;
+  wire [1:0] pal_g = pal_g_a;
 
   // Channel scale ≈ (vga × gain) / 3. Enumerated per gain — the only lossy
   // case is gain=2 where (3 × 2 / 3) = 2 but a plain >>1 would give 1.
@@ -384,12 +413,25 @@ module tt_um_kilian_waves (
     end
   endfunction
 
-  // --- Block F: output.
+  // --- Block F: dual-colour output. A contributes through palette A, B
+  // through palette B (at idx+8); channels sum with saturation to 3 so
+  // overlap regions brighten to the channel-mix colour. B gain is 3 on
+  // every palette entry so the B channel sums amplitudes directly.
+  wire [1:0] R_a = scale_ch(amp_a_vga, pal_r_a);
+  wire [1:0] R_b = scale_ch(amp_b_vga, pal_r_b);
+  wire [1:0] G_a = scale_ch(amp_a_vga, pal_g_a);
+  wire [1:0] G_b = scale_ch(amp_b_vga, pal_g_b);
+  wire [2:0] R_sum = {1'b0, R_a} + {1'b0, R_b};
+  wire [2:0] G_sum = {1'b0, G_a} + {1'b0, G_b};
+  wire [2:0] B_sum = {1'b0, amp_a_vga} + {1'b0, amp_b_vga};
+  wire [1:0] R_sat = R_sum[2] ? 2'd3 : R_sum[1:0];
+  wire [1:0] G_sat = G_sum[2] ? 2'd3 : G_sum[1:0];
+  wire [1:0] B_sat = B_sum[2] ? 2'd3 : B_sum[1:0];
+
   wire dot_on = display_on & dot;
-  wire [1:0] vga_amp = lifted[2:1];
-  wire [1:0] R = dot_on ? scale_ch(vga_amp, pal_r) : 2'b00;
-  wire [1:0] G = dot_on ? scale_ch(vga_amp, pal_g) : 2'b00;
-  wire [1:0] B = dot_on ? vga_amp                  : 2'b00;
+  wire [1:0] R = dot_on ? R_sat : 2'b00;
+  wire [1:0] G = dot_on ? G_sat : 2'b00;
+  wire [1:0] B = dot_on ? B_sat : 2'b00;
 
   // TinyVGA Pmod: {hsync, B[0], G[0], R[0], vsync, B[1], G[1], R[1]}
   assign uo_out = {hsync, B[0], G[0], R[0], vsync, B[1], G[1], R[1]};
