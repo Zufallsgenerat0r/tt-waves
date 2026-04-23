@@ -450,6 +450,43 @@ async def test_morph_env_zero_amp_variation(dut):
 
 
 @cocotb.test()
+async def test_pattern_mode_centres(dut):
+    """Pattern mode mux: verify each of the 4 B-source formulas is actually
+    used. Force ptr_counter so pattern_mode takes each value and read
+    center_bx/center_by directly."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    await ClockCycles(dut.clk, 64)
+    try:
+        _ = dut.user_project.pattern_mode.value
+    except AttributeError:
+        dut._log.info("pattern_mode not accessible (GL sim?); skipping")
+        return
+
+    seen_centres = set()
+    for mode in range(4):
+        # PATTERN_SHIFT=6 places mode bits at ptr_counter[7:6]. Use a pc value
+        # where the Lissajous drive puts ptr_x / ptr_y off-centre so the
+        # different modes produce distinguishable centres.
+        pc = 200 | (mode << 6)
+        dut.user_project.ptr_counter.value = pc
+        await ClockCycles(dut.clk, 8)
+        pm = int(dut.user_project.pattern_mode.value)
+        bx = int(dut.user_project.center_bx.value.signed_integer)
+        by = int(dut.user_project.center_by.value.signed_integer)
+        assert pm == mode, f"expected pattern_mode={mode}, got {pm}"
+        seen_centres.add((bx, by))
+        if mode == 3:
+            assert (bx, by) == (320, 240), \
+                f"mode=3 should anchor B at (320,240); got ({bx},{by})"
+
+    assert len(seen_centres) == 4, \
+        f"all 4 pattern modes should produce distinct centres; saw {seen_centres}"
+
+
+@cocotb.test()
 async def test_palette_cycles_through_hues(dut):
     """Sweep ptr_counter across all 16 palette entries and verify each entry
     produces the expected R/G gain pattern (the hue LUT from PORT_PLAN)."""

@@ -103,11 +103,28 @@ module tt_um_kilian_waves (
                            : (ptr_y_raw > 10'sd303) ? 10'sd303
                            : ptr_y_raw;
 
-  // --- Source centres: A = pointer, B = point-mirror ---
+  // --- Pattern mode: 2-bit auto-cycle that picks how source B relates to A.
+  // 0 = point-mirror (F's original behaviour)
+  // 1 = y-mirror only (sources share x, B above/below A)
+  // 2 = x-mirror only (sources share y, B left/right of A)
+  // 3 = B anchored at screen centre
+  // PATTERN_SHIFT=6 → each mode holds for 64 frames (~1 s at 60 Hz).
+  localparam PATTERN_SHIFT = 6;
+  wire [1:0] pattern_mode = ptr_counter[PATTERN_SHIFT+1 : PATTERN_SHIFT];
+
+  // --- Source centres: A = pointer, B = pattern-dependent.
   wire signed [9:0] center_ax = ptr_x;
   wire signed [9:0] center_ay = ptr_y;
-  wire signed [9:0] center_bx = 10'sd640 - ptr_x;
-  wire signed [9:0] center_by = 10'sd480 - ptr_y;
+  wire signed [9:0] mirror_x  = 10'sd640 - ptr_x;
+  wire signed [9:0] mirror_y  = 10'sd480 - ptr_y;
+  wire signed [9:0] center_bx =
+      (pattern_mode == 2'd1) ? ptr_x       :   // y-mirror only (share x)
+      (pattern_mode == 2'd3) ? 10'sd320    :   // centre
+                               mirror_x;       // modes 0, 2 use mirror
+  wire signed [9:0] center_by =
+      (pattern_mode == 2'd2) ? ptr_y       :   // x-mirror only (share y)
+      (pattern_mode == 2'd3) ? 10'sd240    :   // centre
+                               mirror_y;       // modes 0, 1 use mirror
 
   // --- Time-muxed pixel-to-centre subtractors (p_?x, p_?y).
   // One shared x-subtractor, operand muxed by phase; same for y.
