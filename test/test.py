@@ -393,8 +393,11 @@ async def test_morph_env_zero_static_lattice(dut):
 
 @cocotb.test()
 async def test_morph_env_full_binary(dut):
-    """At morph_env=15 every lit pixel is fully saturated (VGA level 3 on all
-    three channels) — the amplitude path lifts level to binary full."""
+    """At morph_env=15 every lit pixel is at max blue (VGA level 3).
+    The hue palette rotates around the blue corner of the VGA cube, so
+    the B channel is always at full gain — at env=15 the amplitude is
+    also binary-full, so B must be 3 on every lit pixel regardless of
+    which palette entry is active."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps")
     cocotb.start_soon(clock.start())
     await reset_dut(dut)
@@ -414,16 +417,17 @@ async def test_morph_env_full_binary(dut):
         for (r, g, b) in row:
             if r or g or b:
                 lit_any += 1
-                if r != 3 or g != 3 or b != 3:
+                if b != 3:
                     partial += 1
     assert lit_any > 0, "no lit pixels captured"
-    assert partial == 0, f"{partial}/{lit_any} lit pixels not at full brightness at env=15"
+    assert partial == 0, f"{partial}/{lit_any} lit pixels not at full B at env=15"
 
 
 @cocotb.test()
 async def test_morph_env_zero_amp_variation(dut):
     """At morph_env=0 the amplitude path modulates dot brightness, so the
-    frame must contain at least two distinct non-black VGA levels."""
+    frame must contain at least two distinct non-black VGA levels. Check B
+    specifically — it's always driven by amp regardless of palette tint."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps")
     cocotb.start_soon(clock.start())
     await reset_dut(dut)
@@ -440,9 +444,38 @@ async def test_morph_env_zero_amp_variation(dut):
     levels = set()
     for row in pixels:
         for (r, g, b) in row:
-            if r or g or b:
-                levels.add(r)
-    assert len(levels) >= 2, f"expected varying brightness at env=0; got levels {sorted(levels)}"
+            if b:
+                levels.add(b)
+    assert len(levels) >= 2, f"expected varying B brightness at env=0; got levels {sorted(levels)}"
+
+
+@cocotb.test()
+async def test_palette_cycles_through_hues(dut):
+    """Sweep ptr_counter across all 16 palette entries and verify each entry
+    produces the expected R/G gain pattern (the hue LUT from PORT_PLAN)."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    await ClockCycles(dut.clk, 64)
+    try:
+        _ = dut.user_project.pal_r.value
+    except AttributeError:
+        dut._log.info("pal_r not accessible (GL sim?); skipping")
+        return
+
+    expected = [  # (R_gain, G_gain) per palette index
+        (3, 3), (3, 3), (2, 3), (1, 3), (0, 3), (0, 2), (0, 1), (0, 0),
+        (0, 0), (1, 0), (2, 0), (3, 0), (3, 0), (3, 1), (3, 2), (3, 3),
+    ]
+    # palette_shift=6, so each index occupies pc[9:6]=idx with lower bits zero.
+    for idx in range(16):
+        dut.user_project.ptr_counter.value = idx << 6
+        await ClockCycles(dut.clk, 4)
+        r = int(dut.user_project.pal_r.value)
+        g = int(dut.user_project.pal_g.value)
+        assert (r, g) == expected[idx], \
+            f"palette {idx}: got ({r},{g}), expected {expected[idx]}"
 
 
 @cocotb.test()

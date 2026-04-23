@@ -342,14 +342,54 @@ module tt_um_kilian_waves (
   wire [3:0] lifted_raw = {1'b0, level} + {1'b0, amp_lift};
   wire [2:0] lifted = lifted_raw[3] ? 3'b111 : lifted_raw[2:0];
 
-  // --- Block E: output.
-  // Palette hardwired to white; each channel carries the 2-bit amplitude
-  // slice lifted[2:1], giving 4 VGA levels.
+  // --- Block E: palette lookup.
+  // pal_idx cycles 0..15 every 2^PALETTE_SHIFT frames; full hue ring = 1024
+  // frames at shift=6 (~17 s at 60 Hz). The 16-entry LUT walks through
+  // white → cyan → blue → magenta → white; B stays at gain 3 the whole time
+  // (the palette is a rotation around the blue corner of the VGA cube), so
+  // hardwire pal_b = 3 and save a 2-bit mux per-entry and a scale stage.
+  localparam PALETTE_SHIFT = 6;
+  wire [3:0] pal_idx = ptr_counter[PALETTE_SHIFT+3 : PALETTE_SHIFT];
+
+  reg [1:0] pal_r, pal_g;
+  always @(*) begin
+    case (pal_idx)
+      4'd2:         begin pal_r = 2'd2; pal_g = 2'd3; end
+      4'd3:         begin pal_r = 2'd1; pal_g = 2'd3; end
+      4'd4:         begin pal_r = 2'd0; pal_g = 2'd3; end
+      4'd5:         begin pal_r = 2'd0; pal_g = 2'd2; end
+      4'd6:         begin pal_r = 2'd0; pal_g = 2'd1; end
+      4'd7, 4'd8:   begin pal_r = 2'd0; pal_g = 2'd0; end
+      4'd9:         begin pal_r = 2'd1; pal_g = 2'd0; end
+      4'd10:        begin pal_r = 2'd2; pal_g = 2'd0; end
+      4'd11, 4'd12: begin pal_r = 2'd3; pal_g = 2'd0; end
+      4'd13:        begin pal_r = 2'd3; pal_g = 2'd1; end
+      4'd14:        begin pal_r = 2'd3; pal_g = 2'd2; end
+      default:      begin pal_r = 2'd3; pal_g = 2'd3; end  // idx 0, 1, 15 = white
+    endcase
+  end
+
+  // Channel scale ≈ (vga × gain) / 3. Enumerated per gain — the only lossy
+  // case is gain=2 where (3 × 2 / 3) = 2 but a plain >>1 would give 1.
+  function [1:0] scale_ch;
+    input [1:0] vga;
+    input [1:0] gain;
+    begin
+      case (gain)
+        2'd0:    scale_ch = 2'd0;
+        2'd1:    scale_ch = {1'b0, vga[1] & vga[0]};                 // only vga=3 → 1
+        2'd2:    scale_ch = {vga[1] & vga[0], vga[1] & ~vga[0]};     // 0,0,1,2
+        default: scale_ch = vga;                                      // gain=3 → pass-through
+      endcase
+    end
+  endfunction
+
+  // --- Block F: output.
   wire dot_on = display_on & dot;
   wire [1:0] vga_amp = lifted[2:1];
-  wire [1:0] R = dot_on ? vga_amp : 2'b00;
-  wire [1:0] G = dot_on ? vga_amp : 2'b00;
-  wire [1:0] B = dot_on ? vga_amp : 2'b00;
+  wire [1:0] R = dot_on ? scale_ch(vga_amp, pal_r) : 2'b00;
+  wire [1:0] G = dot_on ? scale_ch(vga_amp, pal_g) : 2'b00;
+  wire [1:0] B = dot_on ? vga_amp                  : 2'b00;
 
   // TinyVGA Pmod: {hsync, B[0], G[0], R[0], vsync, B[1], G[1], R[1]}
   assign uo_out = {hsync, B[0], G[0], R[0], vsync, B[1], G[1], R[1]};
