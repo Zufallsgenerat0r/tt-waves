@@ -379,13 +379,15 @@ async def test_morph_env_zero_static_lattice(dut):
     pixels = await capture_frame(dut)
 
     # With zero displacement, every dot sits centred at (cx*16+8, cy*16+8) with
-    # Chebyshev radius 2 → 5x5 block at [cx*16+6 .. cx*16+10] × [cy*16+6 .. cy*16+10].
+    # Chebyshev radius 2. The `dot` register adds a one-pixel x-pipeline lag
+    # (hpos and dot both update on phase=0, but dot is sampled pre-update),
+    # so lit columns are x%16 ∈ [5..9]; y has no lag → y%16 ∈ [6..10].
     # Check that OUTSIDE this centred region every pixel is black.
     stray = 0
     for y in range(V_DISPLAY):
         for x in range(H_DISPLAY):
             lx, ly = x % LATTICE, y % LATTICE
-            in_centre = 6 <= lx <= 10 and 6 <= ly <= 10
+            in_centre = 5 <= lx <= 9 and 6 <= ly <= 10
             if not in_centre and is_lit(pixels[y][x]):
                 stray += 1
     assert stray == 0, f"{stray} pixels lit outside cell centres at env=0"
