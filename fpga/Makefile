@@ -20,7 +20,7 @@ $(PROJ).bit: $(PROJ).config
 	ecppack --compress --bit $@ $<
 
 prog: $(PROJ).bit
-	dfu-util -d 1209:5af0 -a 0 -D $@
+	dfu-util -d 1209:5af0 -a 0 -D $<
 
 clean:
 	rm -f $(PROJ).json $(PROJ).config $(PROJ).bit
